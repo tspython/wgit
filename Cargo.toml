@@ -1,0 +1,16 @@
+[package]
+name = "wgit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11"
+pollster = "0.4"
+wgpu = "26.0.0"
+winit = { version = "0.30.8", features = ["android-native-activity"] }
+bytemuck = { version = "1.15", features = ["derive"] }
+anyhow = "1.0.100"
+ab_glyph = "0.2.31"
+unicode-segmentation = "1.12.0"
+gix = { version = "0.67.0", default-features = false }
+tree-sitter = "0.22.6"
