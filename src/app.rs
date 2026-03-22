@@ -488,10 +488,12 @@ impl State {
         FONT_PX * self.ui_scale
     }
 
+    #[allow(dead_code)] // UI helper consistent with font_px / status_bar_height
     fn side_padding(&self) -> f32 {
         SIDE_PADDING * self.ui_scale
     }
 
+    #[allow(dead_code)] // UI helper consistent with font_px / status_bar_height
     fn top_padding(&self) -> f32 {
         TOP_PADDING * self.ui_scale
     }

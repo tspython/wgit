@@ -682,6 +682,7 @@ impl GitModel {
     }
 
     /// Legacy: build a single combined document (kept for backwards compatibility).
+    #[allow(dead_code)] // public API kept for backwards compatibility
     pub fn build_grouped_document(&mut self) -> anyhow::Result<(Document, GroupedGitViewMeta)> {
         let (file_doc, meta, _diff_doc) = self.build_split_documents()?;
         Ok((file_doc, meta))

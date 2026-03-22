@@ -192,6 +192,7 @@ impl DocLine {
         self
     }
 
+    #[allow(dead_code)] // builder method, part of DocLine's public API
     pub fn with_line_number(mut self, ln: DiffLineNumber) -> Self {
         self.line_number = Some(ln);
         self
