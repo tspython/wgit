@@ -1938,10 +1938,10 @@ impl State {
             // Add separator between groups
             if let Some(pg) = prev_group {
                 if pg != button.group {
-                    // Vertical separator line
-                    let sep_x = x + self.cell_width * 0.3;
-                    let sep_y = by + self.ui(10.0);
-                    let sep_h = bh - self.ui(20.0);
+                    // Vertical separator line between button groups
+                    let sep_x = x;
+                    let sep_y = by + self.ui(12.0);
+                    let sep_h = bh - self.ui(24.0);
                     push_styled_rect(
                         rect_instances,
                         [sep_x, sep_y, 1.0, sep_h],
@@ -1956,7 +1956,7 @@ impl State {
                         [0.0, 0.0],
                         0.0,
                     );
-                    x += self.cell_width * 1.2;
+                    x += self.ui(10.0);
                 }
             }
 
@@ -2000,7 +2000,8 @@ impl State {
                 &button.label,
                 button.style.text,
             )?;
-            x += self.cell_width;
+            // Advance past the chip right padding (ui(8)) plus gap between chips
+            x += self.ui(12.0);
 
             prev_group = Some(button.group);
         }
