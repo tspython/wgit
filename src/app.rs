@@ -2242,11 +2242,9 @@ impl State {
             0.0,
         );
 
-        // ── Chrome (titlebar, toolbar, status, modals) ───────
+        // ── Top chrome (titlebar, toolbar — rendered before panes) ─
         self.build_titlebar_geometry(&mut text_vertices, &mut rect_instances)?;
         self.build_toolbar_geometry(&mut text_vertices, &mut rect_instances)?;
-        self.build_status_geometry(&mut text_vertices, &mut rect_instances)?;
-        self.build_modal_overlay_geometry(&mut text_vertices, &mut rect_instances)?;
 
         // ── File pane (left) ─────────────────────────────────
         {
@@ -2484,6 +2482,10 @@ impl State {
                 )?;
             }
         }
+
+        // ── Bottom chrome + modals (rendered AFTER panes so they overlay) ─
+        self.build_status_geometry(&mut text_vertices, &mut rect_instances)?;
+        self.build_modal_overlay_geometry(&mut text_vertices, &mut rect_instances)?;
 
         self.text_vbuf = create_vertex_buffer(&self.device, "text_vertices", &text_vertices);
         self.text_vcount = text_vertices.len() as u32;
