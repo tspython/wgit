@@ -1038,6 +1038,28 @@ impl State {
         text_vertices: &mut Vec<TextVertex>,
         rect_instances: &mut Vec<StyledRectInstance>,
     ) -> anyhow::Result<()> {
+        if matches!(self.input_mode, InputMode::Normal) {
+            return Ok(());
+        }
+
+        // Full-screen dimming scrim behind all modals
+        let w = self.size.width as f32;
+        let h = self.size.height as f32;
+        push_styled_rect(
+            rect_instances,
+            [0.0, 0.0, w, h],
+            [0.0, 0.0, 0.0, 0.55],
+            [0.0, 0.0, 0.0, 0.65],
+            [0.0; 4],
+            [0.0; 4],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
         match self.input_mode {
             InputMode::CommitSummary | InputMode::CommitBody => {
                 self.build_commit_overlay_geometry(text_vertices, rect_instances)
@@ -1088,14 +1110,14 @@ impl State {
         let body_active = matches!(self.input_mode, InputMode::CommitBody);
 
         let summary_fill = if summary_active {
-            ([0.25, 0.31, 0.47, 0.78], [0.19, 0.24, 0.37, 0.72])
+            ([0.25, 0.31, 0.47, 1.0], [0.19, 0.24, 0.37, 1.0])
         } else {
-            ([0.19, 0.22, 0.31, 0.58], [0.15, 0.18, 0.25, 0.54])
+            ([0.17, 0.20, 0.28, 1.0], [0.13, 0.16, 0.22, 1.0])
         };
         let body_fill = if body_active {
-            ([0.25, 0.31, 0.47, 0.78], [0.19, 0.24, 0.37, 0.72])
+            ([0.25, 0.31, 0.47, 1.0], [0.19, 0.24, 0.37, 1.0])
         } else {
-            ([0.19, 0.22, 0.31, 0.58], [0.15, 0.18, 0.25, 0.54])
+            ([0.17, 0.20, 0.28, 1.0], [0.13, 0.16, 0.22, 1.0])
         };
 
         let field_w = panel[2] - self.ui(32.0);
@@ -1224,15 +1246,15 @@ impl State {
             let selected = idx == self.repo_picker_index;
             let (fill_top, fill_bottom, stroke) = if selected {
                 (
-                    [0.25, 0.33, 0.50, 0.76],
-                    [0.18, 0.24, 0.38, 0.72],
-                    [0.52, 0.68, 0.98, 0.56],
+                    [0.25, 0.33, 0.50, 1.0],
+                    [0.18, 0.24, 0.38, 1.0],
+                    [0.52, 0.68, 0.98, 0.70],
                 )
             } else {
                 (
-                    [0.18, 0.20, 0.28, 0.62],
-                    [0.14, 0.16, 0.22, 0.54],
-                    [0.34, 0.40, 0.52, 0.34],
+                    [0.16, 0.18, 0.26, 1.0],
+                    [0.12, 0.14, 0.20, 1.0],
+                    [0.30, 0.36, 0.48, 0.40],
                 )
             };
             push_styled_rect(
@@ -2479,8 +2501,8 @@ impl State {
         &mut self,
         glyphs: &[ShapedGlyph],
         scroll_y: f32,
-        _clip_left: f32,
-        _clip_right: f32,
+        clip_left: f32,
+        clip_right: f32,
         clip_top: f32,
         clip_bottom: f32,
         text_vertices: &mut Vec<TextVertex>,
@@ -2499,8 +2521,8 @@ impl State {
             let x1 = x0 + uv.w as f32;
             let y1 = y0 + uv.h as f32;
 
-            // Skip glyphs fully outside the vertical clip region
-            if y1 < clip_top || y0 > clip_bottom {
+            // Skip glyphs fully outside the clip region
+            if y1 < clip_top || y0 > clip_bottom || x1 < clip_left || x0 > clip_right {
                 continue;
             }
 

@@ -104,12 +104,12 @@ pub const TOOLBAR_SEPARATOR: [f32; 4] = [0.30, 0.33, 0.40, 0.30];
 pub const DIVIDER_COLOR: [f32; 4] = [0.22, 0.25, 0.32, 0.50];
 
 // ── Modal overlay ────────────────────────────────────────────────
-pub const MODAL_BG_TOP: [f32; 4] = [0.12, 0.14, 0.20, 0.97];
-pub const MODAL_BG_BOTTOM: [f32; 4] = [0.08, 0.10, 0.16, 0.97];
+pub const MODAL_BG_TOP: [f32; 4] = [0.12, 0.14, 0.20, 1.0];
+pub const MODAL_BG_BOTTOM: [f32; 4] = [0.08, 0.10, 0.16, 1.0];
 pub const MODAL_BORDER: [f32; 4] = [0.35, 0.45, 0.70, 0.60];
 
-pub const MODAL_DANGER_BG_TOP: [f32; 4] = [0.20, 0.12, 0.12, 0.97];
-pub const MODAL_DANGER_BG_BOTTOM: [f32; 4] = [0.14, 0.08, 0.08, 0.97];
+pub const MODAL_DANGER_BG_TOP: [f32; 4] = [0.20, 0.12, 0.12, 1.0];
+pub const MODAL_DANGER_BG_BOTTOM: [f32; 4] = [0.14, 0.08, 0.08, 1.0];
 pub const MODAL_DANGER_BORDER: [f32; 4] = [0.80, 0.35, 0.35, 0.60];
 
 // ── Status bar per-kind ──────────────────────────────────────────
