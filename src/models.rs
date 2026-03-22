@@ -154,11 +154,48 @@ pub struct ColorSpan {
     pub color: [f32; 4],
 }
 
+/// Which pane currently has keyboard focus
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusPane {
+    Files,
+    Diff,
+}
+
+/// Line number info for diff lines (old line, new line)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiffLineNumber {
+    pub old: Option<u32>,
+    pub new: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DocLine {
     pub text: String,
     pub style: LineStyle,
     pub spans: Vec<ColorSpan>,
+    /// Only set for diff document lines
+    pub line_number: Option<DiffLineNumber>,
+}
+
+impl DocLine {
+    pub fn new(text: impl Into<String>, style: LineStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            spans: Vec::new(),
+            line_number: None,
+        }
+    }
+
+    pub fn with_spans(mut self, spans: Vec<ColorSpan>) -> Self {
+        self.spans = spans;
+        self
+    }
+
+    pub fn with_line_number(mut self, ln: DiffLineNumber) -> Self {
+        self.line_number = Some(ln);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -169,11 +206,7 @@ pub struct Document {
 impl Document {
     pub fn from_lines(mut lines: Vec<DocLine>) -> Self {
         if lines.is_empty() {
-            lines.push(DocLine {
-                text: String::new(),
-                style: LineStyle::Dim,
-                spans: Vec::new(),
-            });
+            lines.push(DocLine::new("", LineStyle::Dim));
         }
         Self { lines }
     }
@@ -192,6 +225,10 @@ impl Document {
 
     pub fn line_spans(&self, line_index: usize) -> &[ColorSpan] {
         &self.lines[line_index].spans
+    }
+
+    pub fn line_number(&self, line_index: usize) -> Option<DiffLineNumber> {
+        self.lines[line_index].line_number
     }
 }
 
