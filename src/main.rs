@@ -3,6 +3,7 @@ mod git_model;
 mod models;
 mod render;
 mod repo_store;
+#[allow(dead_code)]
 mod theme;
 
 use std::{env, ffi::OsString, path::PathBuf};

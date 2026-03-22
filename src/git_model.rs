@@ -3,7 +3,7 @@ use std::{env, path::Path, path::PathBuf, process::Command};
 use anyhow::Context;
 use tree_sitter::{Language, Node, Parser};
 
-use crate::models::{ColorSpan, DocLine, Document, GitViewMeta, LineStyle};
+use crate::models::{ColorSpan, DiffLineNumber, DocLine, Document, GitViewMeta, LineStyle};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GitEntry {
@@ -526,16 +526,16 @@ impl GitModel {
         summarize_porcelain_status(status)
     }
 
-    pub fn build_grouped_document(&mut self) -> anyhow::Result<(Document, GroupedGitViewMeta)> {
-        let mut lines: Vec<DocLine> = Vec::new();
+    /// Build the file list document (left pane) and the diff document (right pane) separately.
+    pub fn build_split_documents(
+        &mut self,
+    ) -> anyhow::Result<(Document, GroupedGitViewMeta, Document)> {
+        use crate::theme;
 
-        lines.push(DocLine {
-            text: String::from("FILES"),
-            style: LineStyle::Header,
-            spans: Vec::new(),
-        });
+        // ── File list document (left pane) ───────────────────
+        let mut file_lines: Vec<DocLine> = Vec::new();
 
-        let files_start_line = lines.len();
+        let files_start_line = file_lines.len();
         let selected_entry = self.entries.get(self.selected);
         let grouped = grouped_entries(&self.entries);
         let mut sections = Vec::new();
@@ -545,36 +545,41 @@ impl GitModel {
             StatusSectionKind::Unstaged,
             StatusSectionKind::Untracked,
         ] {
-            let start_line = lines.len();
+            let start_line = file_lines.len();
             let rows = &grouped[kind.index()];
-            lines.push(DocLine {
-                text: kind.title().to_string(),
-                style: LineStyle::Header,
-                spans: Vec::new(),
-            });
+
+            let section_style = match kind {
+                StatusSectionKind::Staged => LineStyle::SectionStaged,
+                StatusSectionKind::Unstaged => LineStyle::SectionUnstaged,
+                StatusSectionKind::Untracked => LineStyle::SectionUntracked,
+            };
+            let header_text = format!(" {} ({})", kind.title(), rows.len());
+            file_lines.push(DocLine::new(header_text, section_style));
 
             if rows.is_empty() {
-                lines.push(DocLine {
-                    text: String::from("  (none)"),
-                    style: LineStyle::Dim,
-                    spans: Vec::new(),
-                });
+                file_lines.push(DocLine::new("   No files", LineStyle::Dim));
             } else {
                 for entry in rows.iter() {
-                    let marker = if selected_entry == Some(*entry) {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    lines.push(DocLine {
-                        text: format!("{} {} {}", marker, entry.xy, entry.path),
-                        style: if selected_entry == Some(*entry) {
-                            LineStyle::Selected
-                        } else {
-                            LineStyle::Normal
-                        },
-                        spans: Vec::new(),
-                    });
+                    let is_selected = selected_entry == Some(*entry);
+                    let badge = theme::badge_char_for_status(&entry.xy);
+                    let text = format!("  {}  {}", badge, entry.path);
+                    let badge_color = theme::badge_color_for_status(&entry.xy);
+                    let spans = vec![ColorSpan {
+                        start_col: 2,
+                        end_col: 3,
+                        color: badge_color,
+                    }];
+                    file_lines.push(
+                        DocLine::new(
+                            text,
+                            if is_selected {
+                                LineStyle::Selected
+                            } else {
+                                LineStyle::Normal
+                            },
+                        )
+                        .with_spans(spans),
+                    );
                 }
             }
 
@@ -586,45 +591,100 @@ impl GitModel {
             });
         }
 
-        let files_count = lines.len() - files_start_line;
+        let files_count = file_lines.len() - files_start_line;
 
-        lines.push(DocLine {
-            text: String::new(),
-            style: LineStyle::Dim,
-            spans: Vec::new(),
-        });
+        let file_doc = Document::from_lines(file_lines);
+        let file_meta = GroupedGitViewMeta {
+            files_start_line,
+            files_count,
+            sections,
+        };
 
+        // ── Diff document (right pane) ───────────────────────
+        let diff_doc = self.build_diff_document()?;
+
+        Ok((file_doc, file_meta, diff_doc))
+    }
+
+    /// Build just the diff document with line numbers.
+    fn build_diff_document(&mut self) -> anyhow::Result<Document> {
+        let mut lines: Vec<DocLine> = Vec::new();
+
+        // Diff file header
         let diff_title = self
             .entries
             .get(self.selected)
-            .map(|e| format!("DIFF {}", e.path))
-            .unwrap_or_else(|| String::from("DIFF"));
-        lines.push(DocLine {
-            text: diff_title,
-            style: LineStyle::Header,
-            spans: Vec::new(),
-        });
+            .map(|e| format!(" {}", e.path))
+            .unwrap_or_else(|| String::from(" No file selected"));
+        lines.push(DocLine::new(diff_title, LineStyle::DiffFileHeader));
 
-        let diff_lines: Vec<String> = self.diff.lines().map(normalize_for_display).collect();
-        let diff_styles: Vec<LineStyle> = self.diff.lines().map(style_for_diff_line).collect();
-        let diff_spans = self.syntax_spans_for_diff_lines(&diff_lines, &diff_styles)?;
+        // Parse diff lines with line numbers
+        let raw_lines: Vec<String> = self.diff.lines().map(|l| l.to_string()).collect();
+        let diff_texts: Vec<String> = raw_lines.iter().map(|l| normalize_for_display(l)).collect();
+        let diff_styles: Vec<LineStyle> = raw_lines.iter().map(|l| style_for_diff_line(l)).collect();
+        let diff_spans = self.syntax_spans_for_diff_lines(&diff_texts, &diff_styles)?;
 
-        for ((text, style), spans) in diff_lines
+        // Track line numbers through hunk headers
+        let mut old_line: u32 = 0;
+        let mut new_line: u32 = 0;
+
+        for (i, ((text, style), spans)) in diff_texts
             .into_iter()
             .zip(diff_styles.into_iter())
             .zip(diff_spans.into_iter())
+            .enumerate()
         {
-            lines.push(DocLine { text, style, spans });
+            let raw = &raw_lines[i];
+            let ln = match style {
+                LineStyle::DiffHunk => {
+                    // Parse @@ -old,count +new,count @@ ...
+                    if let Some((o, n)) = parse_hunk_header(raw) {
+                        old_line = o;
+                        new_line = n;
+                    }
+                    None
+                }
+                LineStyle::DiffAdd => {
+                    let ln = DiffLineNumber {
+                        old: None,
+                        new: Some(new_line),
+                    };
+                    new_line += 1;
+                    Some(ln)
+                }
+                LineStyle::DiffRemove => {
+                    let ln = DiffLineNumber {
+                        old: Some(old_line),
+                        new: None,
+                    };
+                    old_line += 1;
+                    Some(ln)
+                }
+                LineStyle::Normal => {
+                    // Context line — has both line numbers
+                    let ln = DiffLineNumber {
+                        old: Some(old_line),
+                        new: Some(new_line),
+                    };
+                    old_line += 1;
+                    new_line += 1;
+                    Some(ln)
+                }
+                _ => None, // metadata lines
+            };
+
+            let mut doc_line = DocLine::new(text, style).with_spans(spans);
+            doc_line.line_number = ln;
+            lines.push(doc_line);
         }
 
-        Ok((
-            Document::from_lines(lines),
-            GroupedGitViewMeta {
-                files_start_line,
-                files_count,
-                sections,
-            },
-        ))
+        Ok(Document::from_lines(lines))
+    }
+
+    /// Legacy: build a single combined document (kept for backwards compatibility).
+    pub fn build_grouped_document(&mut self) -> anyhow::Result<(Document, GroupedGitViewMeta)> {
+        let (file_doc, meta, _diff_doc) = self.build_split_documents()?;
+        Ok((file_doc, meta))
     }
 
     fn diff_for_path(&self, path: &str, cached: bool) -> anyhow::Result<String> {
@@ -855,51 +915,34 @@ impl GitModel {
     pub fn build_document(&mut self) -> anyhow::Result<(Document, GitViewMeta)> {
         let mut lines: Vec<DocLine> = Vec::new();
 
-        lines.push(DocLine {
-            text: String::from("FILES"),
-            style: LineStyle::Header,
-            spans: Vec::new(),
-        });
+        lines.push(DocLine::new("FILES", LineStyle::Header));
 
         let files_start_line = lines.len();
         if self.entries.is_empty() {
-            lines.push(DocLine {
-                text: String::from("  (working tree clean)"),
-                style: LineStyle::Dim,
-                spans: Vec::new(),
-            });
+            lines.push(DocLine::new("  (working tree clean)", LineStyle::Dim));
         } else {
             for (idx, e) in self.entries.iter().enumerate() {
                 let marker = if idx == self.selected { ">" } else { " " };
-                lines.push(DocLine {
-                    text: format!("{} {} {}", marker, e.xy, e.path),
-                    style: if idx == self.selected {
+                lines.push(DocLine::new(
+                    format!("{} {} {}", marker, e.xy, e.path),
+                    if idx == self.selected {
                         LineStyle::Selected
                     } else {
                         LineStyle::Normal
                     },
-                    spans: Vec::new(),
-                });
+                ));
             }
         }
         let files_count = self.entries.len();
 
-        lines.push(DocLine {
-            text: String::new(),
-            style: LineStyle::Dim,
-            spans: Vec::new(),
-        });
+        lines.push(DocLine::new("", LineStyle::Dim));
 
         let diff_title = self
             .entries
             .get(self.selected)
             .map(|e| format!("DIFF {}", e.path))
             .unwrap_or_else(|| String::from("DIFF"));
-        lines.push(DocLine {
-            text: diff_title,
-            style: LineStyle::Header,
-            spans: Vec::new(),
-        });
+        lines.push(DocLine::new(diff_title, LineStyle::Header));
 
         let diff_lines: Vec<String> = self.diff.lines().map(normalize_for_display).collect();
         let diff_styles: Vec<LineStyle> = self.diff.lines().map(style_for_diff_line).collect();
@@ -910,7 +953,7 @@ impl GitModel {
             .zip(diff_styles.into_iter())
             .zip(diff_spans.into_iter())
         {
-            lines.push(DocLine { text, style, spans });
+            lines.push(DocLine::new(text, style).with_spans(spans));
         }
 
         Ok((
@@ -1165,16 +1208,43 @@ fn style_for_diff_line(line: &str) -> LineStyle {
         LineStyle::DiffAdd
     } else if line.starts_with('-') && !line.starts_with("---") {
         LineStyle::DiffRemove
-    } else if line.starts_with("diff --git")
-        || line.starts_with("index ")
+    } else if line.starts_with("diff --git") {
+        LineStyle::DiffFileHeader
+    } else if line.starts_with("index ")
         || line.starts_with("--- ")
         || line.starts_with("+++ ")
         || line.starts_with("# ")
     {
-        LineStyle::Dim
+        LineStyle::DiffMeta
     } else {
         LineStyle::Normal
     }
+}
+
+/// Parse `@@ -old,count +new,count @@` → (old_start, new_start)
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    // Format: @@ -<old_start>[,<old_count>] +<new_start>[,<new_count>] @@
+    let rest = line.strip_prefix("@@ -")?;
+    let minus_end = rest.find(' ')?;
+    let old_part = &rest[..minus_end];
+    let old_start: u32 = old_part
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+
+    let rest = &rest[minus_end..];
+    let plus_start = rest.find('+')?;
+    let rest = &rest[plus_start + 1..];
+    let plus_end = rest.find(' ').unwrap_or(rest.len());
+    let new_part = &rest[..plus_end];
+    let new_start: u32 = new_part
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+
+    Some((old_start, new_start))
 }
 
 fn normalize_for_display(text: &str) -> String {
@@ -1280,11 +1350,11 @@ not a status line
         ));
         assert!(matches!(
             style_for_diff_line("+++ b/src/lib.rs"),
-            LineStyle::Dim
+            LineStyle::DiffMeta
         ));
         assert!(matches!(
             style_for_diff_line("index 123..456"),
-            LineStyle::Dim
+            LineStyle::DiffMeta
         ));
     }
 
@@ -1292,6 +1362,14 @@ not a status line
     fn normalizes_tabs_and_crlf() {
         let text = "a\tb\r\nc";
         assert_eq!(normalize_for_display(text), "a   b\nc");
+    }
+
+    #[test]
+    fn parses_hunk_headers() {
+        assert_eq!(parse_hunk_header("@@ -10,5 +20,8 @@ fn foo()"), Some((10, 20)));
+        assert_eq!(parse_hunk_header("@@ -1 +1 @@"), Some((1, 1)));
+        assert_eq!(parse_hunk_header("@@ -0,0 +1,3 @@"), Some((0, 1)));
+        assert_eq!(parse_hunk_header("not a hunk"), None);
     }
 
     #[test]

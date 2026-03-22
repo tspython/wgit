@@ -14,8 +14,8 @@ use winit::{
 
 use crate::git_model::{BranchTrackingStatus, GitModel, GroupedGitViewMeta};
 use crate::models::{
-    ButtonConfig, ButtonStyle, Document, LineStyle, ShapedGlyph, ToolbarAction, ToolbarButton,
-    VisualLine, WindowControlAction, WindowControlButton,
+    ButtonConfig, ButtonStyle, Document, FocusPane, LineStyle, ShapedGlyph, ToolbarAction,
+    ToolbarButton, ToolbarGroup, VisualLine, WindowControlAction, WindowControlButton,
 };
 use crate::render::{
     Atlas, GlyphCache, GlyphKey, GlyphUV, QuadVertex, StyledRectInstance, TextVertex, Uniforms,
@@ -23,7 +23,8 @@ use crate::render::{
 };
 use crate::repo_store;
 use crate::theme::{
-    ATLAS_SIZE, COLOR_BG, COLOR_ROW_SELECTED, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP,
+    self, ATLAS_SIZE, COLOR_BG, COLOR_ROW_SELECTED, COLOR_ROW_SELECTED_BORDER,
+    COLOR_ROW_SELECTED_BOTTOM, COLOR_SELECTION_ACCENT_BAR, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP,
     STATUS_BAR_HEIGHT, STATUS_BAR_SIDE_PADDING, TOP_PADDING,
 };
 
@@ -48,6 +49,11 @@ impl AppStatus {
             message: message.into(),
         }
     }
+}
+
+enum PaneRef {
+    Files,
+    Diff,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,10 +88,24 @@ struct State {
     ascent: f32,
 
     git: GitModel,
-    doc: Document,
+
+    // ── File pane (left) ──────────────────────────────────
+    file_doc: Document,
     file_line_to_index: Vec<Option<usize>>,
     file_index_to_line: Vec<usize>,
-    visual_lines: Vec<VisualLine>,
+    file_visual_lines: Vec<VisualLine>,
+    file_scroll_y: f32,
+    file_content_height: f32,
+
+    // ── Diff pane (right) ─────────────────────────────────
+    diff_doc: Document,
+    diff_visual_lines: Vec<VisualLine>,
+    diff_scroll_y: f32,
+    diff_content_height: f32,
+
+    // ── Focus ─────────────────────────────────────────────
+    focus_pane: FocusPane,
+
     status: AppStatus,
     input_mode: InputMode,
     commit_summary: String,
@@ -95,9 +115,6 @@ struct State {
     repo_picker_index: usize,
     repo_picker_scroll: usize,
     pending_discard_path: Option<PathBuf>,
-
-    scroll_y: f32,
-    content_height: f32,
     mouse_pos: PhysicalPosition<f64>,
     window_controls: Vec<WindowControlButton>,
     toolbar_buttons: Vec<ToolbarButton>,
@@ -141,8 +158,9 @@ impl State {
         );
         let glyph_cache = GlyphCache::new();
         let font = load_primary_font().context("failed to load font")?;
-        let (doc, view_meta) = git.build_grouped_document()?;
-        let (file_line_to_index, file_index_to_line) = build_grouped_file_maps(&doc, &view_meta);
+        let (file_doc, view_meta, diff_doc) = git.build_split_documents()?;
+        let (file_line_to_index, file_index_to_line) =
+            build_grouped_file_maps(&file_doc, &view_meta);
 
         let text_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("text_bgl"),
@@ -405,10 +423,17 @@ impl State {
             ascent: FONT_PX * ui_scale,
             ui_scale,
             git,
-            doc,
+            file_doc,
             file_line_to_index,
             file_index_to_line,
-            visual_lines: Vec::new(),
+            file_visual_lines: Vec::new(),
+            file_scroll_y: 0.0,
+            file_content_height: 0.0,
+            diff_doc,
+            diff_visual_lines: Vec::new(),
+            diff_scroll_y: 0.0,
+            diff_content_height: 0.0,
+            focus_pane: FocusPane::Files,
             status: AppStatus::new(StatusKind::Neutral, "Ready"),
             input_mode: InputMode::Normal,
             commit_summary: String::new(),
@@ -418,8 +443,6 @@ impl State {
             repo_picker_index: 0,
             repo_picker_scroll: 0,
             pending_discard_path: None,
-            scroll_y: 0.0,
-            content_height: 0.0,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             window_controls: Vec::new(),
             toolbar_buttons: Vec::new(),
@@ -527,43 +550,29 @@ impl State {
 
     fn status_fill(&self) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) {
         match self.status.kind {
-            StatusKind::Neutral => (
-                [0.16, 0.20, 0.31, 0.84],
-                [0.11, 0.14, 0.22, 0.88],
-                [0.34, 0.46, 0.70, 0.58],
-                [0.88, 0.94, 1.0, 1.0],
-            ),
-            StatusKind::Success => (
-                [0.17, 0.29, 0.22, 0.88],
-                [0.11, 0.21, 0.16, 0.92],
-                [0.28, 0.72, 0.44, 0.62],
-                [0.88, 1.0, 0.92, 1.0],
-            ),
-            StatusKind::Error => (
-                [0.33, 0.18, 0.18, 0.92],
-                [0.23, 0.11, 0.11, 0.96],
-                [0.82, 0.39, 0.39, 0.72],
-                [1.0, 0.92, 0.92, 1.0],
-            ),
-            StatusKind::Prompt => (
-                [0.24, 0.20, 0.12, 0.92],
-                [0.19, 0.15, 0.08, 0.96],
-                [0.82, 0.68, 0.34, 0.70],
-                [1.0, 0.95, 0.86, 1.0],
-            ),
+            StatusKind::Neutral => theme::STATUS_NEUTRAL,
+            StatusKind::Success => theme::STATUS_SUCCESS,
+            StatusKind::Error => theme::STATUS_ERROR,
+            StatusKind::Prompt => theme::STATUS_PROMPT,
         }
     }
 
     fn selection_status_message(&self) -> String {
         let count = self.git.entries_len();
+        let pane_label = match self.focus_pane {
+            FocusPane::Files => "FILES",
+            FocusPane::Diff => "DIFF",
+        };
         if count == 0 {
-            format!("Working tree clean on branch {}", self.git.branch())
+            format!(
+                "[{pane_label}]  Working tree clean  \u{2502}  {}  \u{2502}  Tab switch pane  c commit  o repos  q quit",
+                self.git.branch()
+            )
         } else {
             format!(
-                "Selected change {}/{} on branch {}",
+                "[{pane_label}]  {}/{}  \u{2502}  s stage  u unstage  x discard  c commit  Tab switch pane  j/k scroll",
                 self.git.selected_index() + 1,
                 count,
-                self.git.branch()
             )
         }
     }
@@ -762,7 +771,8 @@ impl State {
 
     fn selected_file_path(&self) -> Option<PathBuf> {
         let line_idx = self.file_index_to_line.get(self.git.selected_index())?;
-        let text = self.doc.line_text(*line_idx);
+        let text = self.file_doc.line_text(*line_idx);
+        // Text format: "  M  filename.rs" — path starts after "  X  "
         text.get(5..).map(|path| PathBuf::from(path.trim()))
     }
 
@@ -860,24 +870,6 @@ impl State {
         }
     }
 
-    fn repo_context_label(&self) -> String {
-        let mut text = format!(
-            "{}  -  branch:{}",
-            self.git.repo_root().display(),
-            self.git.branch()
-        );
-
-        if let Some(upstream) = &self.repo_tracking.upstream {
-            text.push_str(&format!(
-                "  upstream:{}  ↑{} ↓{}",
-                upstream, self.repo_tracking.ahead, self.repo_tracking.behind
-            ));
-        } else {
-            text.push_str("  upstream:none");
-        }
-
-        text
-    }
 
     fn handle_discard_confirm_input(&mut self, key: &Key) -> anyhow::Result<bool> {
         match key {
@@ -984,11 +976,7 @@ impl State {
     }
 
     fn status_bar_rect(&self) -> [f32; 4] {
-        let toolbar = self.toolbar_bar_rect();
-        let x = self.status_bar_side_padding();
-        let y = toolbar[1] + toolbar[3] + self.status_bar_gap();
-        let w = (self.size.width as f32 - self.status_bar_side_padding() * 2.0).max(1.0);
-        [x, y, w, self.status_bar_height()]
+        self.status_bar_rect_raw()
     }
 
     fn build_status_geometry(
@@ -1015,16 +1003,16 @@ impl State {
         );
 
         let prefix = match self.status.kind {
-            StatusKind::Neutral => "ready",
-            StatusKind::Success => "ok",
-            StatusKind::Error => "error",
-            StatusKind::Prompt => "commit",
+            StatusKind::Neutral => "\u{25CF}",  // ●
+            StatusKind::Success => "\u{2713}",  // ✓
+            StatusKind::Error => "\u{2717}",    // ✗
+            StatusKind::Prompt => "\u{25B6}",   // ▶
         };
         let max_chars = ((bar[2] - self.ui(18.0)) / self.cell_width).max(1.0) as usize;
         let prefix_chars = prefix.chars().count() + 2;
         let text_message =
             compact_status_message(&self.status.message, max_chars.saturating_sub(prefix_chars));
-        let status_text = format!("{prefix}: {text_message}");
+        let status_text = format!("{prefix}  {text_message}");
 
         let mut x = bar[0] + self.ui(10.0);
         let baseline = bar[1] + (bar[3] - self.line_height) * 0.5 + self.ascent;
@@ -1050,6 +1038,28 @@ impl State {
         text_vertices: &mut Vec<TextVertex>,
         rect_instances: &mut Vec<StyledRectInstance>,
     ) -> anyhow::Result<()> {
+        if matches!(self.input_mode, InputMode::Normal) {
+            return Ok(());
+        }
+
+        // Full-screen dimming scrim behind all modals
+        let w = self.size.width as f32;
+        let h = self.size.height as f32;
+        push_styled_rect(
+            rect_instances,
+            [0.0, 0.0, w, h],
+            [0.0, 0.0, 0.0, 0.55],
+            [0.0, 0.0, 0.0, 0.65],
+            [0.0; 4],
+            [0.0; 4],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
         match self.input_mode {
             InputMode::CommitSummary | InputMode::CommitBody => {
                 self.build_commit_overlay_geometry(text_vertices, rect_instances)
@@ -1073,16 +1083,16 @@ impl State {
         push_styled_rect(
             rect_instances,
             panel,
-            [0.14, 0.17, 0.24, 0.96],
-            [0.10, 0.13, 0.19, 0.96],
-            [0.35, 0.47, 0.71, 0.62],
-            [0.0, 0.0, 0.0, 0.0],
+            theme::MODAL_BG_TOP,
+            theme::MODAL_BG_BOTTOM,
+            theme::MODAL_BORDER,
+            [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
             1.0,
-            0.0,
-            [0.0, 0.0],
-            0.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1100,14 +1110,14 @@ impl State {
         let body_active = matches!(self.input_mode, InputMode::CommitBody);
 
         let summary_fill = if summary_active {
-            ([0.25, 0.31, 0.47, 0.78], [0.19, 0.24, 0.37, 0.72])
+            ([0.25, 0.31, 0.47, 1.0], [0.19, 0.24, 0.37, 1.0])
         } else {
-            ([0.19, 0.22, 0.31, 0.58], [0.15, 0.18, 0.25, 0.54])
+            ([0.17, 0.20, 0.28, 1.0], [0.13, 0.16, 0.22, 1.0])
         };
         let body_fill = if body_active {
-            ([0.25, 0.31, 0.47, 0.78], [0.19, 0.24, 0.37, 0.72])
+            ([0.25, 0.31, 0.47, 1.0], [0.19, 0.24, 0.37, 1.0])
         } else {
-            ([0.19, 0.22, 0.31, 0.58], [0.15, 0.18, 0.25, 0.54])
+            ([0.17, 0.20, 0.28, 1.0], [0.13, 0.16, 0.22, 1.0])
         };
 
         let field_w = panel[2] - self.ui(32.0);
@@ -1204,16 +1214,16 @@ impl State {
         push_styled_rect(
             rect_instances,
             panel,
-            [0.14, 0.17, 0.24, 0.96],
-            [0.10, 0.13, 0.19, 0.96],
-            [0.41, 0.49, 0.69, 0.62],
-            [0.0, 0.0, 0.0, 0.0],
+            theme::MODAL_BG_TOP,
+            theme::MODAL_BG_BOTTOM,
+            theme::MODAL_BORDER,
+            [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
             1.0,
-            0.0,
-            [0.0, 0.0],
-            0.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1236,15 +1246,15 @@ impl State {
             let selected = idx == self.repo_picker_index;
             let (fill_top, fill_bottom, stroke) = if selected {
                 (
-                    [0.25, 0.33, 0.50, 0.76],
-                    [0.18, 0.24, 0.38, 0.72],
-                    [0.52, 0.68, 0.98, 0.56],
+                    [0.25, 0.33, 0.50, 1.0],
+                    [0.18, 0.24, 0.38, 1.0],
+                    [0.52, 0.68, 0.98, 0.70],
                 )
             } else {
                 (
-                    [0.18, 0.20, 0.28, 0.62],
-                    [0.14, 0.16, 0.22, 0.54],
-                    [0.34, 0.40, 0.52, 0.34],
+                    [0.16, 0.18, 0.26, 1.0],
+                    [0.12, 0.14, 0.20, 1.0],
+                    [0.30, 0.36, 0.48, 0.40],
                 )
             };
             push_styled_rect(
@@ -1305,16 +1315,16 @@ impl State {
         push_styled_rect(
             rect_instances,
             panel,
-            [0.24, 0.15, 0.15, 0.96],
-            [0.17, 0.10, 0.10, 0.96],
-            [0.84, 0.38, 0.38, 0.62],
-            [0.0, 0.0, 0.0, 0.0],
+            theme::MODAL_DANGER_BG_TOP,
+            theme::MODAL_DANGER_BG_BOTTOM,
+            theme::MODAL_DANGER_BORDER,
+            [0.0, 0.0, 0.0, 0.32],
             self.ui(12.0),
             1.0,
             1.0,
-            0.0,
-            [0.0, 0.0],
-            0.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1356,11 +1366,15 @@ impl State {
     }
 
     fn refresh_document_from_git(&mut self) -> anyhow::Result<()> {
-        let (doc, meta) = self.git.build_grouped_document()?;
-        let (file_line_to_index, file_index_to_line) = build_grouped_file_maps(&doc, &meta);
-        self.doc = doc;
+        let (file_doc, meta, diff_doc) = self.git.build_split_documents()?;
+        let (file_line_to_index, file_index_to_line) =
+            build_grouped_file_maps(&file_doc, &meta);
+        self.file_doc = file_doc;
+        self.diff_doc = diff_doc;
         self.file_line_to_index = file_line_to_index;
         self.file_index_to_line = file_index_to_line;
+        // Reset diff scroll when file changes
+        self.diff_scroll_y = 0.0;
         self.refresh_repo_tracking()?;
         self.layout_dirty = true;
         self.geometry_dirty = true;
@@ -1368,40 +1382,76 @@ impl State {
     }
 
     fn rebuild_layout(&mut self) {
-        self.visual_lines.clear();
-        let mut y = self.top_padding();
+        let content = self.content_panel_rect();
 
-        for line_idx in 0..self.doc.line_count() {
-            self.visual_lines.push(VisualLine {
+        // ── File pane layout ──────────────────────────────
+        self.file_visual_lines.clear();
+        let mut y = content[1] + self.ui(8.0);
+        for line_idx in 0..self.file_doc.line_count() {
+            self.file_visual_lines.push(VisualLine {
                 y_top: y,
                 line_index: line_idx,
-                style: self.doc.line_style(line_idx),
+                style: self.file_doc.line_style(line_idx),
                 glyphs: Vec::new(),
                 shaped: false,
             });
             y += self.line_height;
         }
+        self.file_content_height = (y + self.ui(16.0)).max(content[3]);
 
-        self.content_height = (y + self.top_padding()).max(self.size.height as f32);
+        // ── Diff pane layout ──────────────────────────────
+        self.diff_visual_lines.clear();
+        let mut y = content[1] + self.ui(8.0);
+        for line_idx in 0..self.diff_doc.line_count() {
+            self.diff_visual_lines.push(VisualLine {
+                y_top: y,
+                line_index: line_idx,
+                style: self.diff_doc.line_style(line_idx),
+                glyphs: Vec::new(),
+                shaped: false,
+            });
+            y += self.line_height;
+        }
+        self.diff_content_height = (y + self.ui(16.0)).max(content[3]);
+
         self.clamp_scroll();
         self.layout_dirty = false;
         self.geometry_dirty = true;
     }
 
-    fn ensure_visual_line_shaped(&mut self, idx: usize) {
-        if idx >= self.visual_lines.len() || self.visual_lines[idx].shaped {
+    fn ensure_file_line_shaped(&mut self, idx: usize) {
+        if idx >= self.file_visual_lines.len() || self.file_visual_lines[idx].shaped {
             return;
         }
+        let file_pane = self.file_pane_rect();
+        let x_start = file_pane[0] + self.ui(8.0);
+        self.shape_line_for_pane(idx, &PaneRef::Files, x_start);
+    }
 
-        let y_top = self.visual_lines[idx].y_top;
-        let line_index = self.visual_lines[idx].line_index;
-        let style = self.visual_lines[idx].style;
+    fn ensure_diff_line_shaped(&mut self, idx: usize) {
+        if idx >= self.diff_visual_lines.len() || self.diff_visual_lines[idx].shaped {
+            return;
+        }
+        let diff_pane = self.diff_pane_rect();
+        let x_start = diff_pane[0] + self.diff_line_number_width() + self.ui(8.0);
+        self.shape_line_for_pane(idx, &PaneRef::Diff, x_start);
+    }
+
+    fn shape_line_for_pane(&mut self, idx: usize, pane: &PaneRef, x_start: f32) {
+        let (doc, visual_lines) = match pane {
+            PaneRef::Files => (&self.file_doc, &mut self.file_visual_lines),
+            PaneRef::Diff => (&self.diff_doc, &mut self.diff_visual_lines),
+        };
+
+        let y_top = visual_lines[idx].y_top;
+        let line_index = visual_lines[idx].line_index;
+        let style = visual_lines[idx].style;
         let baseline = y_top + self.ascent;
 
-        let mut x = self.side_padding();
+        let mut x = x_start;
         let mut glyphs = Vec::new();
-        let line_text = self.doc.line_text(line_index);
-        let spans = self.doc.line_spans(line_index);
+        let line_text = doc.line_text(line_index);
+        let spans = doc.line_spans(line_index);
 
         for (col, ch) in line_text.chars().enumerate() {
             if !ch.is_control() {
@@ -1421,8 +1471,8 @@ impl State {
             x += self.cell_width;
         }
 
-        self.visual_lines[idx].glyphs = glyphs;
-        self.visual_lines[idx].shaped = true;
+        visual_lines[idx].glyphs = glyphs;
+        visual_lines[idx].shaped = true;
     }
 
     fn ensure_glyph(&mut self, glyph_id: u16) -> anyhow::Result<Option<GlyphUV>> {
@@ -1550,12 +1600,41 @@ impl State {
 
     fn content_panel_rect(&self) -> [f32; 4] {
         let tb = self.toolbar_bar_rect();
-        [
-            0.0,
-            tb[1] + tb[3],
-            self.size.width as f32,
-            (self.size.height as f32 - (tb[1] + tb[3])).max(1.0),
-        ]
+        let status = self.status_bar_rect_raw();
+        let top = tb[1] + tb[3];
+        let bottom = status[1] - self.status_bar_gap();
+        [0.0, top, self.size.width as f32, (bottom - top).max(1.0)]
+    }
+
+    /// Raw status bar rect without depending on content_panel_rect (avoids recursion)
+    fn status_bar_rect_raw(&self) -> [f32; 4] {
+        let x = self.status_bar_side_padding();
+        let y = self.size.height as f32 - self.status_bar_height() - self.status_bar_gap();
+        let w = (self.size.width as f32 - self.status_bar_side_padding() * 2.0).max(1.0);
+        [x, y, w, self.status_bar_height()]
+    }
+
+    /// File pane (left) — 30% of content width
+    fn file_pane_rect(&self) -> [f32; 4] {
+        let content = self.content_panel_rect();
+        let pane_w = (content[2] * 0.30).max(self.ui(180.0)).min(content[2] * 0.5);
+        [content[0], content[1], pane_w, content[3]]
+    }
+
+    /// Diff pane (right) — remaining width
+    fn diff_pane_rect(&self) -> [f32; 4] {
+        let content = self.content_panel_rect();
+        let file_pane = self.file_pane_rect();
+        let divider_w = self.ui(1.0);
+        let diff_x = file_pane[0] + file_pane[2] + divider_w;
+        let diff_w = (content[0] + content[2] - diff_x).max(1.0);
+        [diff_x, content[1], diff_w, content[3]]
+    }
+
+    /// Width reserved for line numbers in diff pane
+    fn diff_line_number_width(&self) -> f32 {
+        // "9999 9999 " = 10 chars
+        self.cell_width * 10.0
     }
 
     fn append_text_run(
@@ -1631,15 +1710,32 @@ impl State {
         let bw = bar[2];
         let bh = bar[3];
 
+        // Titlebar background
         push_styled_rect(
             rect_instances,
             bar,
-            [0.11, 0.12, 0.16, 1.0],
-            [0.09, 0.10, 0.14, 1.0],
+            theme::COLOR_TITLEBAR_TOP,
+            theme::COLOR_TITLEBAR_BOTTOM,
             [0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0,
             1.0,
+            0.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
+        // Bottom divider line for titlebar
+        push_styled_rect(
+            rect_instances,
+            [bx, by + bh - 1.0, bw, 1.0],
+            theme::DIVIDER_COLOR,
+            theme::DIVIDER_COLOR,
+            [0.0; 4],
+            [0.0; 4],
+            0.0,
+            0.0,
             0.0,
             0.0,
             [0.0, 0.0],
@@ -1694,139 +1790,208 @@ impl State {
             cx += self.ui(18.0);
         }
 
-        let max_label_chars =
-            (((bw - self.ui(176.0)).max(self.ui(160.0))) / self.cell_width).max(18.0) as usize;
-        let path_label = compact_status_message(&self.repo_context_label(), max_label_chars);
-        let label_w = path_label.chars().count() as f32 * self.cell_width;
-        let mut x = (bx + bw * 0.5 - label_w * 0.5).max(bx + self.ui(88.0));
+        // Build titlebar content: "wgit" brand + repo path + branch badge
         let baseline = by + (bh - self.line_height) * 0.5 + self.ascent;
+        let mut x = bx + self.ui(68.0); // After window controls
+
+        // Brand name
         self.append_text_run(
             text_vertices,
             &mut x,
             baseline,
-            &path_label,
-            [0.78, 0.82, 0.90, 1.0],
+            "wgit",
+            theme::TEXT_ACCENT,
         )?;
+        x += self.cell_width;
+
+        // Repo path (dimmed)
+        let repo_name = self
+            .git
+            .repo_root()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.append_text_run(
+            text_vertices,
+            &mut x,
+            baseline,
+            &repo_name,
+            theme::TEXT_SECONDARY,
+        )?;
+        x += self.cell_width * 2.0;
+
+        // Branch badge with background chip
+        let branch = self.repo_tracking.branch.clone();
+        let branch_label = format!("\u{E0A0} {}", branch); //
+        let branch_chars = branch_label.chars().count() as f32;
+        let chip_w = branch_chars * self.cell_width + self.ui(14.0);
+        let chip_h = self.line_height - self.ui(4.0);
+        let chip_y = by + (bh - chip_h) * 0.5;
+
+        push_styled_rect(
+            rect_instances,
+            [x - self.ui(7.0), chip_y, chip_w, chip_h],
+            [0.18, 0.24, 0.38, 0.70],
+            [0.14, 0.18, 0.30, 0.65],
+            theme::ACCENT_BLUE_DIM,
+            [0.0; 4],
+            self.ui(5.0),
+            1.0,
+            1.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
+        self.append_text_run(
+            text_vertices,
+            &mut x,
+            baseline,
+            &branch_label,
+            theme::ACCENT_BLUE,
+        )?;
+        x += self.cell_width;
+
+        // Ahead/behind indicators
+        if self.repo_tracking.ahead > 0 {
+            let ahead_text = format!("\u{2191}{}", self.repo_tracking.ahead);
+            self.append_text_run(
+                text_vertices,
+                &mut x,
+                baseline,
+                &ahead_text,
+                theme::ACCENT_GREEN,
+            )?;
+            x += self.cell_width;
+        }
+        if self.repo_tracking.behind > 0 {
+            let behind_text = format!("\u{2193}{}", self.repo_tracking.behind);
+            self.append_text_run(
+                text_vertices,
+                &mut x,
+                baseline,
+                &behind_text,
+                theme::ACCENT_RED,
+            )?;
+        };
 
         Ok(())
     }
 
     fn toolbar_button_configs(&self) -> Vec<ButtonConfig> {
-        let style = |fill_top, fill_bottom, stroke| ButtonStyle {
-            fill_top,
-            fill_bottom,
-            stroke,
-            text: [0.92, 0.96, 1.0, 1.0],
+        let green_btn = ButtonStyle {
+            fill_top: [0.16, 0.28, 0.20, 0.50],
+            fill_bottom: [0.12, 0.22, 0.16, 0.45],
+            stroke: [0.36, 0.68, 0.46, 0.50],
+            text: theme::ACCENT_GREEN,
+        };
+        let blue_btn = ButtonStyle {
+            fill_top: [0.16, 0.22, 0.36, 0.50],
+            fill_bottom: [0.12, 0.17, 0.28, 0.45],
+            stroke: [0.36, 0.50, 0.78, 0.50],
+            text: theme::ACCENT_BLUE,
+        };
+        let purple_btn = ButtonStyle {
+            fill_top: [0.22, 0.17, 0.34, 0.50],
+            fill_bottom: [0.17, 0.13, 0.26, 0.45],
+            stroke: [0.50, 0.40, 0.78, 0.50],
+            text: theme::ACCENT_PURPLE,
+        };
+        let yellow_btn = ButtonStyle {
+            fill_top: [0.28, 0.24, 0.14, 0.50],
+            fill_bottom: [0.22, 0.18, 0.10, 0.45],
+            stroke: [0.68, 0.56, 0.30, 0.50],
+            text: theme::ACCENT_YELLOW,
+        };
+        let red_btn = ButtonStyle {
+            fill_top: [0.32, 0.14, 0.14, 0.60],
+            fill_bottom: [0.26, 0.10, 0.10, 0.55],
+            stroke: [0.78, 0.34, 0.34, 0.60],
+            text: theme::ACCENT_RED,
+        };
+        let gray_btn = ButtonStyle {
+            fill_top: [0.18, 0.18, 0.20, 0.40],
+            fill_bottom: [0.14, 0.14, 0.16, 0.35],
+            stroke: [0.40, 0.40, 0.44, 0.35],
+            text: theme::TEXT_SECONDARY,
         };
 
         vec![
+            // ── Staging group ─────────────────────
             ButtonConfig {
-                label: String::from("[o] repos"),
-                action: ToolbarAction::RepoSwitch,
-                style: style(
-                    [0.34, 0.33, 0.20, 0.30],
-                    [0.24, 0.23, 0.14, 0.26],
-                    [0.70, 0.66, 0.38, 0.42],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[c] commit"),
-                action: ToolbarAction::Commit,
-                style: style(
-                    [0.42, 0.31, 0.17, 0.34],
-                    [0.28, 0.20, 0.10, 0.30],
-                    [0.92, 0.72, 0.36, 0.46],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[r] refresh"),
-                action: ToolbarAction::Refresh,
-                style: style(
-                    [0.27, 0.37, 0.64, 0.30],
-                    [0.20, 0.28, 0.49, 0.26],
-                    [0.52, 0.66, 0.98, 0.42],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[s] stage"),
+                label: String::from("s stage"),
                 action: ToolbarAction::Stage,
-                style: style(
-                    [0.24, 0.40, 0.30, 0.30],
-                    [0.16, 0.28, 0.21, 0.26],
-                    [0.44, 0.76, 0.54, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: green_btn,
             },
             ButtonConfig {
-                label: String::from("[a] stage all"),
+                label: String::from("a all"),
                 action: ToolbarAction::StageAll,
-                style: style(
-                    [0.20, 0.42, 0.28, 0.30],
-                    [0.14, 0.30, 0.20, 0.26],
-                    [0.40, 0.80, 0.52, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: green_btn,
             },
             ButtonConfig {
-                label: String::from("[u] unstage"),
+                label: String::from("u unstage"),
                 action: ToolbarAction::Unstage,
-                style: style(
-                    [0.42, 0.28, 0.28, 0.30],
-                    [0.32, 0.19, 0.19, 0.26],
-                    [0.86, 0.45, 0.45, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: yellow_btn,
             },
             ButtonConfig {
-                label: String::from("[U] unstage all"),
+                label: String::from("U all"),
                 action: ToolbarAction::UnstageAll,
-                style: style(
-                    [0.46, 0.26, 0.22, 0.30],
-                    [0.34, 0.18, 0.16, 0.26],
-                    [0.88, 0.53, 0.40, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: yellow_btn,
+            },
+            // ── Git ops group ─────────────────────
+            ButtonConfig {
+                label: String::from("c commit"),
+                action: ToolbarAction::Commit,
+                group: ToolbarGroup::GitOps,
+                style: blue_btn,
             },
             ButtonConfig {
-                label: String::from("[x] discard"),
-                action: ToolbarAction::Discard,
-                style: style(
-                    [0.48, 0.18, 0.18, 0.30],
-                    [0.34, 0.12, 0.12, 0.26],
-                    [0.92, 0.42, 0.42, 0.42],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[f] fetch"),
+                label: String::from("f fetch"),
                 action: ToolbarAction::Fetch,
-                style: style(
-                    [0.25, 0.34, 0.48, 0.30],
-                    [0.17, 0.24, 0.36, 0.26],
-                    [0.46, 0.63, 0.84, 0.42],
-                ),
+                group: ToolbarGroup::GitOps,
+                style: purple_btn,
             },
             ButtonConfig {
-                label: String::from("[p] pull"),
+                label: String::from("p pull"),
                 action: ToolbarAction::Pull,
-                style: style(
-                    [0.25, 0.30, 0.50, 0.30],
-                    [0.18, 0.22, 0.38, 0.26],
-                    [0.49, 0.60, 0.89, 0.42],
-                ),
+                group: ToolbarGroup::GitOps,
+                style: purple_btn,
             },
             ButtonConfig {
-                label: String::from("[P] push"),
+                label: String::from("P push"),
                 action: ToolbarAction::Push,
-                style: style(
-                    [0.30, 0.25, 0.48, 0.30],
-                    [0.22, 0.17, 0.34, 0.26],
-                    [0.60, 0.52, 0.90, 0.42],
-                ),
+                group: ToolbarGroup::GitOps,
+                style: purple_btn,
+            },
+            // ── Danger group ──────────────────────
+            ButtonConfig {
+                label: String::from("x discard"),
+                action: ToolbarAction::Discard,
+                group: ToolbarGroup::Danger,
+                style: red_btn,
+            },
+            // ── App group ─────────────────────────
+            ButtonConfig {
+                label: String::from("o repos"),
+                action: ToolbarAction::RepoSwitch,
+                group: ToolbarGroup::App,
+                style: gray_btn,
             },
             ButtonConfig {
-                label: String::from("[q] quit"),
+                label: String::from("r refresh"),
+                action: ToolbarAction::Refresh,
+                group: ToolbarGroup::App,
+                style: gray_btn,
+            },
+            ButtonConfig {
+                label: String::from("q quit"),
                 action: ToolbarAction::Quit,
-                style: style(
-                    [0.30, 0.30, 0.30, 0.30],
-                    [0.20, 0.20, 0.20, 0.26],
-                    [0.56, 0.56, 0.56, 0.42],
-                ),
+                group: ToolbarGroup::App,
+                style: gray_btn,
             },
         ]
     }
@@ -1844,11 +2009,12 @@ impl State {
         let bw = bar[2];
         let bh = bar[3];
 
+        // Toolbar background
         push_styled_rect(
             rect_instances,
             bar,
-            [0.16, 0.20, 0.31, 1.0],
-            [0.12, 0.15, 0.24, 1.0],
+            theme::COLOR_TOOLBAR_TOP,
+            theme::COLOR_TOOLBAR_BOTTOM,
             [0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0,
@@ -1859,38 +2025,69 @@ impl State {
             0.0,
         );
 
+        // Bottom divider
+        push_styled_rect(
+            rect_instances,
+            [bx, by + bh - 1.0, bw, 1.0],
+            theme::DIVIDER_COLOR,
+            theme::DIVIDER_COLOR,
+            [0.0; 4],
+            [0.0; 4],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
         let mut x = bx + self.ui(14.0);
         let baseline = by + (bh - self.line_height) * 0.5 + self.ascent;
         let text_max_x = bx + bw - self.ui(14.0);
 
-        self.append_text_run(
-            text_vertices,
-            &mut x,
-            baseline,
-            "wgit",
-            [0.90, 0.95, 1.0, 1.0],
-        )?;
-        self.append_text_run(
-            text_vertices,
-            &mut x,
-            baseline,
-            &format!(
-                "  branch:{}  files:{}  ",
-                self.git.branch(),
-                self.git.entries_len()
-            ),
-            [0.80, 0.86, 0.96, 1.0],
-        )?;
+        let buttons = self.toolbar_button_configs();
+        let mut prev_group: Option<ToolbarGroup> = None;
+        let chip_pad_h = self.ui(8.0); // horizontal padding inside chip, each side
+        let chip_gap = self.ui(4.0); // gap between chips in same group
+        let group_gap = self.ui(14.0); // gap between groups (including separator)
 
-        for button in self.toolbar_button_configs() {
+        for button in buttons {
+            // Add separator between groups
+            if let Some(pg) = prev_group {
+                if pg != button.group {
+                    // Vertical separator line between button groups
+                    let sep_x = x + (group_gap * 0.5);
+                    let sep_y = by + self.ui(12.0);
+                    let sep_h = bh - self.ui(24.0);
+                    push_styled_rect(
+                        rect_instances,
+                        [sep_x, sep_y, 1.0, sep_h],
+                        theme::TOOLBAR_SEPARATOR,
+                        theme::TOOLBAR_SEPARATOR,
+                        [0.0; 4],
+                        [0.0; 4],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
+                    x += group_gap;
+                } else {
+                    x += chip_gap;
+                }
+            }
+
             let label_w = button.label.chars().count() as f32 * self.cell_width;
-            if x + label_w + self.ui(22.0) > text_max_x {
+            let chip_w = label_w + chip_pad_h * 2.0;
+
+            if x + chip_w > text_max_x {
                 break;
             }
 
-            let chip_x0 = x - self.ui(6.0);
+            let chip_x0 = x;
             let chip_y0 = by + self.ui(8.0);
-            let chip_w = label_w + self.ui(12.0);
             let chip_h = (bh - self.ui(16.0)).max(1.0);
 
             push_styled_rect(
@@ -1900,7 +2097,7 @@ impl State {
                 button.style.fill_bottom,
                 button.style.stroke,
                 [0.0, 0.0, 0.0, 0.0],
-                self.ui(7.0),
+                self.ui(6.0),
                 1.0,
                 1.0,
                 0.0,
@@ -1916,14 +2113,20 @@ impl State {
                 action: button.action,
             });
 
+            // Position text centered inside the chip
+            let mut text_x = chip_x0 + chip_pad_h;
             self.append_text_run(
                 text_vertices,
-                &mut x,
+                &mut text_x,
                 baseline,
                 &button.label,
                 button.style.text,
             )?;
-            x += self.cell_width;
+
+            // Advance x to the right edge of the chip
+            x = chip_x0 + chip_w;
+
+            prev_group = Some(button.group);
         }
 
         Ok(())
@@ -1959,22 +2162,21 @@ impl State {
     }
 
     fn rebuild_visible_geometry(&mut self) -> anyhow::Result<()> {
-        let top = self.scroll_y;
-        let bottom = self.scroll_y + self.size.height as f32;
-
         let mut text_vertices = Vec::<TextVertex>::new();
         let mut rect_instances = Vec::<StyledRectInstance>::new();
 
-        let w = self.size.width as f32;
         let content = self.content_panel_rect();
+        let file_pane = self.file_pane_rect();
+        let diff_pane = self.diff_pane_rect();
 
+        // ── Content background ───────────────────────────────
         push_styled_rect(
             &mut rect_instances,
             content,
-            [0.09, 0.10, 0.14, 1.0],
-            [0.08, 0.09, 0.13, 1.0],
-            [0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0],
+            theme::COLOR_CONTENT_TOP,
+            theme::COLOR_CONTENT_BOTTOM,
+            [0.0; 4],
+            [0.0; 4],
             0.0,
             1.0,
             0.0,
@@ -1983,126 +2185,307 @@ impl State {
             0.0,
         );
 
+        // ── Pane focus borders ───────────────────────────────
+        let files_focused = self.focus_pane == FocusPane::Files;
+        let diff_focused = self.focus_pane == FocusPane::Diff;
+
+        // File pane top border (focus indicator)
+        if files_focused {
+            push_styled_rect(
+                &mut rect_instances,
+                [file_pane[0], file_pane[1], file_pane[2], self.ui(2.0)],
+                theme::ACCENT_BLUE,
+                theme::ACCENT_BLUE,
+                [0.0; 4],
+                [0.0; 4],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                [0.0, 0.0],
+                0.0,
+            );
+        }
+
+        // Diff pane top border (focus indicator)
+        if diff_focused {
+            push_styled_rect(
+                &mut rect_instances,
+                [diff_pane[0], diff_pane[1], diff_pane[2], self.ui(2.0)],
+                theme::ACCENT_BLUE,
+                theme::ACCENT_BLUE,
+                [0.0; 4],
+                [0.0; 4],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                [0.0, 0.0],
+                0.0,
+            );
+        }
+
+        // ── Vertical divider between panes ───────────────────
+        let divider_x = file_pane[0] + file_pane[2];
+        push_styled_rect(
+            &mut rect_instances,
+            [divider_x, content[1], self.ui(1.0), content[3]],
+            theme::DIVIDER_COLOR,
+            theme::DIVIDER_COLOR,
+            [0.0; 4],
+            [0.0; 4],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
+        // ── Top chrome (titlebar, toolbar — rendered before panes) ─
         self.build_titlebar_geometry(&mut text_vertices, &mut rect_instances)?;
         self.build_toolbar_geometry(&mut text_vertices, &mut rect_instances)?;
-        self.build_status_geometry(&mut text_vertices, &mut rect_instances)?;
-        self.build_modal_overlay_geometry(&mut text_vertices, &mut rect_instances)?;
 
-        let visible_indices: Vec<usize> = self
-            .visual_lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| !(line.y_top + self.line_height < top || line.y_top > bottom))
-            .map(|(idx, _)| idx)
-            .collect();
+        // ── File pane (left) ─────────────────────────────────
+        {
+            let pane = file_pane;
+            let scroll = self.file_scroll_y;
+            let pane_top = pane[1];
+            let pane_bottom = pane[1] + pane[3];
 
-        let selected_line = self.selected_file_line_index();
+            let visible_indices: Vec<usize> = self
+                .file_visual_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let screen_y = line.y_top - scroll;
+                    screen_y + self.line_height > pane_top && screen_y < pane_bottom
+                })
+                .map(|(idx, _)| idx)
+                .collect();
 
-        for idx in visible_indices {
-            self.ensure_visual_line_shaped(idx);
+            let selected_line = self.selected_file_line_index();
 
-            let (y_top, line_index, line_style, glyphs) = {
-                let line = &self.visual_lines[idx];
-                (line.y_top, line.line_index, line.style, line.glyphs.clone())
-            };
+            for idx in visible_indices {
+                self.ensure_file_line_shaped(idx);
 
-            if Some(idx) == selected_line {
-                let y0 = y_top - self.scroll_y;
-                let y1 = y0 + self.line_height;
-                push_styled_rect(
-                    &mut rect_instances,
-                    [
-                        self.ui(8.0),
-                        y0 + self.ui(1.0),
-                        (w - self.ui(16.0)).max(1.0),
-                        (y1 - y0 - self.ui(2.0)).max(1.0),
-                    ],
-                    COLOR_ROW_SELECTED,
-                    [0.32, 0.46, 0.86, 0.18],
-                    [0.50, 0.62, 0.95, 0.34],
-                    [0.0, 0.0, 0.0, 0.0],
-                    self.ui(8.0),
-                    1.0,
-                    1.0,
-                    0.0,
-                    [0.0, 0.0],
-                    0.0,
-                );
-            }
-
-            if matches!(line_style, LineStyle::Header) && line_index > 0 {
-                let text_len = self.doc.line_text(line_index).chars().count() as f32;
-                let chip_w = (text_len * self.cell_width + self.ui(22.0))
-                    .min((w - self.ui(16.0)).max(self.ui(60.0)));
-                let chip_y = y_top - self.scroll_y + self.ui(2.0);
-                push_styled_rect(
-                    &mut rect_instances,
-                    [
-                        self.ui(8.0),
-                        chip_y,
-                        chip_w,
-                        (self.line_height - self.ui(4.0)).max(1.0),
-                    ],
-                    [0.22, 0.29, 0.46, 0.28],
-                    [0.16, 0.22, 0.36, 0.24],
-                    [0.38, 0.50, 0.84, 0.34],
-                    [0.0, 0.0, 0.0, 0.0],
-                    self.ui(7.0),
-                    1.0,
-                    1.0,
-                    0.0,
-                    [0.0, 0.0],
-                    0.0,
-                );
-            }
-
-            for g in glyphs {
-                let uv = match self.ensure_glyph(g.glyph_id)? {
-                    Some(uv) => uv,
-                    None => continue,
+                let (y_top, _line_index, line_style, glyphs) = {
+                    let line = &self.file_visual_lines[idx];
+                    (line.y_top, line.line_index, line.style, line.glyphs.clone())
                 };
-                if uv.w == 0 || uv.h == 0 {
-                    continue;
+
+                let screen_y = y_top - scroll;
+
+                // Selected row highlight
+                if Some(idx) == selected_line {
+                    push_styled_rect(
+                        &mut rect_instances,
+                        [
+                            pane[0] + self.ui(4.0),
+                            screen_y,
+                            (pane[2] - self.ui(8.0)).max(1.0),
+                            self.line_height,
+                        ],
+                        COLOR_ROW_SELECTED,
+                        COLOR_ROW_SELECTED_BOTTOM,
+                        COLOR_ROW_SELECTED_BORDER,
+                        [0.0; 4],
+                        self.ui(5.0),
+                        1.0,
+                        1.0,
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
+                    // Left accent bar
+                    push_styled_rect(
+                        &mut rect_instances,
+                        [
+                            pane[0] + self.ui(4.0),
+                            screen_y + self.ui(2.0),
+                            self.ui(3.0),
+                            self.line_height - self.ui(4.0),
+                        ],
+                        COLOR_SELECTION_ACCENT_BAR,
+                        COLOR_SELECTION_ACCENT_BAR,
+                        [0.0; 4],
+                        [0.0; 4],
+                        self.ui(1.5),
+                        0.5,
+                        0.0,
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
                 }
 
-                let x0 = (g.x + uv.bearing_x).round();
-                let y0 = (g.y + uv.bearing_y - self.scroll_y).round();
-                let x1 = x0 + uv.w as f32;
-                let y1 = y0 + uv.h as f32;
+                // Section header backgrounds
+                if line_style.has_background() {
+                    let (bg_top, bg_bottom, bg_border) = line_style.background_colors();
+                    push_styled_rect(
+                        &mut rect_instances,
+                        [
+                            pane[0] + self.ui(2.0),
+                            screen_y,
+                            (pane[2] - self.ui(4.0)).max(1.0),
+                            self.line_height,
+                        ],
+                        bg_top,
+                        bg_bottom,
+                        bg_border,
+                        [0.0; 4],
+                        self.ui(3.0),
+                        1.0,
+                        1.0,
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
+                }
 
-                let color = g.color;
-                text_vertices.push(TextVertex {
-                    pos: [x0, y0],
-                    uv: [uv.u0, uv.v0],
-                    color,
-                });
-                text_vertices.push(TextVertex {
-                    pos: [x1, y0],
-                    uv: [uv.u1, uv.v0],
-                    color,
-                });
-                text_vertices.push(TextVertex {
-                    pos: [x0, y1],
-                    uv: [uv.u0, uv.v1],
-                    color,
-                });
-                text_vertices.push(TextVertex {
-                    pos: [x0, y1],
-                    uv: [uv.u0, uv.v1],
-                    color,
-                });
-                text_vertices.push(TextVertex {
-                    pos: [x1, y0],
-                    uv: [uv.u1, uv.v0],
-                    color,
-                });
-                text_vertices.push(TextVertex {
-                    pos: [x1, y1],
-                    uv: [uv.u1, uv.v1],
-                    color,
-                });
+                // Render glyphs (clipped to pane)
+                self.emit_glyphs_clipped(
+                    &glyphs,
+                    scroll,
+                    pane[0],
+                    pane[0] + pane[2],
+                    pane_top,
+                    pane_bottom,
+                    &mut text_vertices,
+                )?;
             }
         }
+
+        // ── Diff pane (right) ────────────────────────────────
+        {
+            let pane = diff_pane;
+            let scroll = self.diff_scroll_y;
+            let pane_top = pane[1];
+            let pane_bottom = pane[1] + pane[3];
+            let ln_width = self.diff_line_number_width();
+
+            // Line number gutter background
+            push_styled_rect(
+                &mut rect_instances,
+                [pane[0], pane[1], ln_width, pane[3]],
+                [0.06, 0.065, 0.08, 1.0],
+                [0.055, 0.06, 0.075, 1.0],
+                [0.0; 4],
+                [0.0; 4],
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                [0.0, 0.0],
+                0.0,
+            );
+
+            // Gutter right border
+            push_styled_rect(
+                &mut rect_instances,
+                [pane[0] + ln_width, pane[1], 1.0, pane[3]],
+                theme::DIVIDER_COLOR,
+                theme::DIVIDER_COLOR,
+                [0.0; 4],
+                [0.0; 4],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                [0.0, 0.0],
+                0.0,
+            );
+
+            let visible_indices: Vec<usize> = self
+                .diff_visual_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let screen_y = line.y_top - scroll;
+                    screen_y + self.line_height > pane_top && screen_y < pane_bottom
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+
+            for idx in visible_indices {
+                self.ensure_diff_line_shaped(idx);
+
+                let (y_top, line_index, line_style, glyphs) = {
+                    let line = &self.diff_visual_lines[idx];
+                    (line.y_top, line.line_index, line.style, line.glyphs.clone())
+                };
+
+                let screen_y = y_top - scroll;
+
+                // Line background tints for diff lines
+                if line_style.has_background() {
+                    let (bg_top, bg_bottom, bg_border) = line_style.background_colors();
+                    let is_header = matches!(line_style, LineStyle::DiffFileHeader);
+                    push_styled_rect(
+                        &mut rect_instances,
+                        [
+                            pane[0] + ln_width + self.ui(2.0),
+                            screen_y,
+                            (pane[2] - ln_width - self.ui(4.0)).max(1.0),
+                            self.line_height,
+                        ],
+                        bg_top,
+                        bg_bottom,
+                        if is_header { bg_border } else { [0.0; 4] },
+                        [0.0; 4],
+                        if is_header { self.ui(3.0) } else { self.ui(1.0) },
+                        1.0,
+                        if is_header || bg_border[3] > 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
+                }
+
+                // Line numbers
+                if let Some(ln) = self.diff_doc.line_number(line_index) {
+                    let old_str = ln
+                        .old
+                        .map(|n| format!("{:>4}", n))
+                        .unwrap_or_else(|| "    ".to_string());
+                    let new_str = ln
+                        .new
+                        .map(|n| format!("{:>4}", n))
+                        .unwrap_or_else(|| "    ".to_string());
+                    let ln_text = format!("{} {} ", old_str, new_str);
+
+                    let baseline = screen_y + self.ascent;
+                    let mut ln_x = pane[0] + self.ui(4.0);
+                    let ln_color = theme::TEXT_MUTED;
+                    self.append_text_run(
+                        &mut text_vertices,
+                        &mut ln_x,
+                        baseline,
+                        &ln_text,
+                        ln_color,
+                    )?;
+                }
+
+                // Render glyphs (clipped to diff pane)
+                self.emit_glyphs_clipped(
+                    &glyphs,
+                    scroll,
+                    pane[0],
+                    pane[0] + pane[2],
+                    pane_top,
+                    pane_bottom,
+                    &mut text_vertices,
+                )?;
+            }
+        }
+
+        // ── Bottom chrome + modals (rendered AFTER panes so they overlay) ─
+        self.build_status_geometry(&mut text_vertices, &mut rect_instances)?;
+        self.build_modal_overlay_geometry(&mut text_vertices, &mut rect_instances)?;
 
         self.text_vbuf = create_vertex_buffer(&self.device, "text_vertices", &text_vertices);
         self.text_vcount = text_vertices.len() as u32;
@@ -2115,28 +2498,84 @@ impl State {
         Ok(())
     }
 
-    fn clamp_scroll(&mut self) {
-        let max_scroll = (self.content_height - self.size.height as f32).max(0.0);
-        if self.scroll_y < 0.0 {
-            self.scroll_y = 0.0;
+    /// Emit glyph vertices clipped to a pane region.
+    fn emit_glyphs_clipped(
+        &mut self,
+        glyphs: &[ShapedGlyph],
+        scroll_y: f32,
+        clip_left: f32,
+        clip_right: f32,
+        clip_top: f32,
+        clip_bottom: f32,
+        text_vertices: &mut Vec<TextVertex>,
+    ) -> anyhow::Result<()> {
+        for g in glyphs {
+            let uv = match self.ensure_glyph(g.glyph_id)? {
+                Some(uv) => uv,
+                None => continue,
+            };
+            if uv.w == 0 || uv.h == 0 {
+                continue;
+            }
+
+            let x0 = (g.x + uv.bearing_x).round();
+            let y0 = (g.y + uv.bearing_y - scroll_y).round();
+            let x1 = x0 + uv.w as f32;
+            let y1 = y0 + uv.h as f32;
+
+            // Skip glyphs fully outside the clip region
+            if y1 < clip_top || y0 > clip_bottom || x1 < clip_left || x0 > clip_right {
+                continue;
+            }
+
+            let color = g.color;
+            text_vertices.push(TextVertex { pos: [x0, y0], uv: [uv.u0, uv.v0], color });
+            text_vertices.push(TextVertex { pos: [x1, y0], uv: [uv.u1, uv.v0], color });
+            text_vertices.push(TextVertex { pos: [x0, y1], uv: [uv.u0, uv.v1], color });
+            text_vertices.push(TextVertex { pos: [x0, y1], uv: [uv.u0, uv.v1], color });
+            text_vertices.push(TextVertex { pos: [x1, y0], uv: [uv.u1, uv.v0], color });
+            text_vertices.push(TextVertex { pos: [x1, y1], uv: [uv.u1, uv.v1], color });
         }
-        if self.scroll_y > max_scroll {
-            self.scroll_y = max_scroll;
-        }
+        Ok(())
     }
 
-    fn line_index_at_doc_y(&self, y: f32) -> Option<usize> {
-        self.visual_lines
+    fn clamp_scroll(&mut self) {
+        let file_pane = self.file_pane_rect();
+        let diff_pane = self.diff_pane_rect();
+
+        let file_max = (self.file_content_height - file_pane[3]).max(0.0);
+        self.file_scroll_y = self.file_scroll_y.clamp(0.0, file_max);
+
+        let diff_max = (self.diff_content_height - diff_pane[3]).max(0.0);
+        self.diff_scroll_y = self.diff_scroll_y.clamp(0.0, diff_max);
+    }
+
+    fn file_line_at_y(&self, doc_y: f32) -> Option<usize> {
+        self.file_visual_lines
             .iter()
             .enumerate()
-            .find(|(_, line)| y >= line.y_top && y < line.y_top + self.line_height)
+            .find(|(_, line)| doc_y >= line.y_top && doc_y < line.y_top + self.line_height)
             .map(|(idx, _)| idx)
-            .or_else(|| self.visual_lines.len().checked_sub(1))
     }
 
     fn try_select_file_from_mouse(&mut self, pos: PhysicalPosition<f64>) -> anyhow::Result<bool> {
-        let doc_y = pos.y as f32 + self.scroll_y;
-        let Some(line_idx) = self.line_index_at_doc_y(doc_y) else {
+        let mx = pos.x as f32;
+        let file_pane = self.file_pane_rect();
+
+        // Only handle clicks in the file pane
+        if mx < file_pane[0] || mx > file_pane[0] + file_pane[2] {
+            // Click in diff pane — switch focus there
+            let diff_pane = self.diff_pane_rect();
+            if mx >= diff_pane[0] && mx <= diff_pane[0] + diff_pane[2] {
+                self.focus_pane = FocusPane::Diff;
+                self.geometry_dirty = true;
+            }
+            return Ok(false);
+        }
+
+        self.focus_pane = FocusPane::Files;
+        let doc_y = pos.y as f32 + self.file_scroll_y;
+        let Some(line_idx) = self.file_line_at_y(doc_y) else {
             return Ok(false);
         };
 
@@ -2168,26 +2607,91 @@ impl State {
             MouseScrollDelta::LineDelta(_, y) => -y * self.line_height * 3.0,
             MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
         };
-        self.scroll_y += dy;
+
+        // Determine which pane the mouse is over
+        let mx = self.mouse_pos.x as f32;
+        let file_pane = self.file_pane_rect();
+        let diff_pane = self.diff_pane_rect();
+
+        if mx >= diff_pane[0] && mx <= diff_pane[0] + diff_pane[2] {
+            self.diff_scroll_y += dy;
+        } else if mx >= file_pane[0] && mx <= file_pane[0] + file_pane[2] {
+            self.file_scroll_y += dy;
+        } else {
+            // Default to focused pane
+            match self.focus_pane {
+                FocusPane::Files => self.file_scroll_y += dy,
+                FocusPane::Diff => self.diff_scroll_y += dy,
+            }
+        }
         self.clamp_scroll();
         self.geometry_dirty = true;
     }
 
     fn handle_key(&mut self, key: &Key) -> anyhow::Result<bool> {
         match key {
-            Key::Named(NamedKey::ArrowUp) => self.move_selection_and_refresh(-1),
-            Key::Named(NamedKey::ArrowDown) => self.move_selection_and_refresh(1),
-            Key::Named(NamedKey::PageUp) => {
-                self.scroll_y -= self.size.height as f32 * 0.85;
-                self.clamp_scroll();
+            Key::Named(NamedKey::Tab) => {
+                // Toggle focus between panes
+                self.focus_pane = match self.focus_pane {
+                    FocusPane::Files => FocusPane::Diff,
+                    FocusPane::Diff => FocusPane::Files,
+                };
                 self.geometry_dirty = true;
                 Ok(true)
             }
+            Key::Named(NamedKey::ArrowUp) => {
+                match self.focus_pane {
+                    FocusPane::Files => self.move_selection_and_refresh(-1),
+                    FocusPane::Diff => {
+                        self.diff_scroll_y -= self.line_height * 3.0;
+                        self.clamp_scroll();
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                match self.focus_pane {
+                    FocusPane::Files => self.move_selection_and_refresh(1),
+                    FocusPane::Diff => {
+                        self.diff_scroll_y += self.line_height * 3.0;
+                        self.clamp_scroll();
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
+                }
+            }
+            Key::Named(NamedKey::PageUp) => {
+                match self.focus_pane {
+                    FocusPane::Files => {
+                        self.file_scroll_y -= self.file_pane_rect()[3] * 0.85;
+                        self.clamp_scroll();
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
+                    FocusPane::Diff => {
+                        self.diff_scroll_y -= self.diff_pane_rect()[3] * 0.85;
+                        self.clamp_scroll();
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
+                }
+            }
             Key::Named(NamedKey::PageDown) => {
-                self.scroll_y += self.size.height as f32 * 0.85;
-                self.clamp_scroll();
-                self.geometry_dirty = true;
-                Ok(true)
+                match self.focus_pane {
+                    FocusPane::Files => {
+                        self.file_scroll_y += self.file_pane_rect()[3] * 0.85;
+                        self.clamp_scroll();
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
+                    FocusPane::Diff => {
+                        self.diff_scroll_y += self.diff_pane_rect()[3] * 0.85;
+                        self.clamp_scroll();
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
+                }
             }
             Key::Character(ch) => {
                 let raw = ch.as_ref();
@@ -2206,9 +2710,35 @@ impl State {
 
                 let c = raw.to_ascii_lowercase();
                 match c.as_str() {
+                    "h" => {
+                        self.focus_pane = FocusPane::Files;
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
+                    "l" => {
+                        self.focus_pane = FocusPane::Diff;
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
                     "o" => self.handle_toolbar_action(ToolbarAction::RepoSwitch),
-                    "j" => self.move_selection_and_refresh(1),
-                    "k" => self.move_selection_and_refresh(-1),
+                    "j" => match self.focus_pane {
+                        FocusPane::Files => self.move_selection_and_refresh(1),
+                        FocusPane::Diff => {
+                            self.diff_scroll_y += self.line_height * 3.0;
+                            self.clamp_scroll();
+                            self.geometry_dirty = true;
+                            Ok(true)
+                        }
+                    },
+                    "k" => match self.focus_pane {
+                        FocusPane::Files => self.move_selection_and_refresh(-1),
+                        FocusPane::Diff => {
+                            self.diff_scroll_y -= self.line_height * 3.0;
+                            self.clamp_scroll();
+                            self.geometry_dirty = true;
+                            Ok(true)
+                        }
+                    },
                     "r" => self.handle_toolbar_action(ToolbarAction::Refresh),
                     "s" => self.handle_toolbar_action(ToolbarAction::Stage),
                     "u" => self.handle_toolbar_action(ToolbarAction::Unstage),

@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "../src/theme.rs"]
+mod theme;
+
 #[path = "../src/models.rs"]
 mod models;
 
