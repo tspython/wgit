@@ -1,4 +1,5 @@
 mod app;
+pub mod commands;
 mod git_model;
 mod models;
 mod render;
