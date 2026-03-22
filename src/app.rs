@@ -15,7 +15,7 @@ use winit::{
 use crate::git_model::{BranchTrackingStatus, GitModel, GroupedGitViewMeta};
 use crate::models::{
     ButtonConfig, ButtonStyle, Document, LineStyle, ShapedGlyph, ToolbarAction, ToolbarButton,
-    VisualLine, WindowControlAction, WindowControlButton,
+    ToolbarGroup, VisualLine, WindowControlAction, WindowControlButton,
 };
 use crate::render::{
     Atlas, GlyphCache, GlyphKey, GlyphUV, QuadVertex, StyledRectInstance, TextVertex, Uniforms,
@@ -23,7 +23,8 @@ use crate::render::{
 };
 use crate::repo_store;
 use crate::theme::{
-    ATLAS_SIZE, COLOR_BG, COLOR_ROW_SELECTED, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP,
+    self, ATLAS_SIZE, COLOR_BG, COLOR_ROW_SELECTED, COLOR_ROW_SELECTED_BORDER,
+    COLOR_ROW_SELECTED_BOTTOM, COLOR_SELECTION_ACCENT_BAR, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP,
     STATUS_BAR_HEIGHT, STATUS_BAR_SIDE_PADDING, TOP_PADDING,
 };
 
@@ -527,43 +528,25 @@ impl State {
 
     fn status_fill(&self) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) {
         match self.status.kind {
-            StatusKind::Neutral => (
-                [0.16, 0.20, 0.31, 0.84],
-                [0.11, 0.14, 0.22, 0.88],
-                [0.34, 0.46, 0.70, 0.58],
-                [0.88, 0.94, 1.0, 1.0],
-            ),
-            StatusKind::Success => (
-                [0.17, 0.29, 0.22, 0.88],
-                [0.11, 0.21, 0.16, 0.92],
-                [0.28, 0.72, 0.44, 0.62],
-                [0.88, 1.0, 0.92, 1.0],
-            ),
-            StatusKind::Error => (
-                [0.33, 0.18, 0.18, 0.92],
-                [0.23, 0.11, 0.11, 0.96],
-                [0.82, 0.39, 0.39, 0.72],
-                [1.0, 0.92, 0.92, 1.0],
-            ),
-            StatusKind::Prompt => (
-                [0.24, 0.20, 0.12, 0.92],
-                [0.19, 0.15, 0.08, 0.96],
-                [0.82, 0.68, 0.34, 0.70],
-                [1.0, 0.95, 0.86, 1.0],
-            ),
+            StatusKind::Neutral => theme::STATUS_NEUTRAL,
+            StatusKind::Success => theme::STATUS_SUCCESS,
+            StatusKind::Error => theme::STATUS_ERROR,
+            StatusKind::Prompt => theme::STATUS_PROMPT,
         }
     }
 
     fn selection_status_message(&self) -> String {
         let count = self.git.entries_len();
         if count == 0 {
-            format!("Working tree clean on branch {}", self.git.branch())
+            format!(
+                "Working tree clean  \u{2502}  {}  \u{2502}  j/k navigate  c commit  o repos  q quit",
+                self.git.branch()
+            )
         } else {
             format!(
-                "Selected change {}/{} on branch {}",
+                "{}/{}  \u{2502}  s stage  u unstage  x discard  c commit  j/k navigate  ? help",
                 self.git.selected_index() + 1,
                 count,
-                self.git.branch()
             )
         }
     }
@@ -860,24 +843,6 @@ impl State {
         }
     }
 
-    fn repo_context_label(&self) -> String {
-        let mut text = format!(
-            "{}  -  branch:{}",
-            self.git.repo_root().display(),
-            self.git.branch()
-        );
-
-        if let Some(upstream) = &self.repo_tracking.upstream {
-            text.push_str(&format!(
-                "  upstream:{}  ↑{} ↓{}",
-                upstream, self.repo_tracking.ahead, self.repo_tracking.behind
-            ));
-        } else {
-            text.push_str("  upstream:none");
-        }
-
-        text
-    }
 
     fn handle_discard_confirm_input(&mut self, key: &Key) -> anyhow::Result<bool> {
         match key {
@@ -1015,16 +980,16 @@ impl State {
         );
 
         let prefix = match self.status.kind {
-            StatusKind::Neutral => "ready",
-            StatusKind::Success => "ok",
-            StatusKind::Error => "error",
-            StatusKind::Prompt => "commit",
+            StatusKind::Neutral => "\u{25CF}",  // ●
+            StatusKind::Success => "\u{2713}",  // ✓
+            StatusKind::Error => "\u{2717}",    // ✗
+            StatusKind::Prompt => "\u{25B6}",   // ▶
         };
         let max_chars = ((bar[2] - self.ui(18.0)) / self.cell_width).max(1.0) as usize;
         let prefix_chars = prefix.chars().count() + 2;
         let text_message =
             compact_status_message(&self.status.message, max_chars.saturating_sub(prefix_chars));
-        let status_text = format!("{prefix}: {text_message}");
+        let status_text = format!("{prefix}  {text_message}");
 
         let mut x = bar[0] + self.ui(10.0);
         let baseline = bar[1] + (bar[3] - self.line_height) * 0.5 + self.ascent;
@@ -1073,16 +1038,16 @@ impl State {
         push_styled_rect(
             rect_instances,
             panel,
-            [0.14, 0.17, 0.24, 0.96],
-            [0.10, 0.13, 0.19, 0.96],
-            [0.35, 0.47, 0.71, 0.62],
-            [0.0, 0.0, 0.0, 0.0],
+            theme::MODAL_BG_TOP,
+            theme::MODAL_BG_BOTTOM,
+            theme::MODAL_BORDER,
+            [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
             1.0,
-            0.0,
-            [0.0, 0.0],
-            0.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1204,16 +1169,16 @@ impl State {
         push_styled_rect(
             rect_instances,
             panel,
-            [0.14, 0.17, 0.24, 0.96],
-            [0.10, 0.13, 0.19, 0.96],
-            [0.41, 0.49, 0.69, 0.62],
-            [0.0, 0.0, 0.0, 0.0],
+            theme::MODAL_BG_TOP,
+            theme::MODAL_BG_BOTTOM,
+            theme::MODAL_BORDER,
+            [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
             1.0,
-            0.0,
-            [0.0, 0.0],
-            0.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1305,16 +1270,16 @@ impl State {
         push_styled_rect(
             rect_instances,
             panel,
-            [0.24, 0.15, 0.15, 0.96],
-            [0.17, 0.10, 0.10, 0.96],
-            [0.84, 0.38, 0.38, 0.62],
-            [0.0, 0.0, 0.0, 0.0],
+            theme::MODAL_DANGER_BG_TOP,
+            theme::MODAL_DANGER_BG_BOTTOM,
+            theme::MODAL_DANGER_BORDER,
+            [0.0, 0.0, 0.0, 0.32],
             self.ui(12.0),
             1.0,
             1.0,
-            0.0,
-            [0.0, 0.0],
-            0.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1631,15 +1596,32 @@ impl State {
         let bw = bar[2];
         let bh = bar[3];
 
+        // Titlebar background
         push_styled_rect(
             rect_instances,
             bar,
-            [0.11, 0.12, 0.16, 1.0],
-            [0.09, 0.10, 0.14, 1.0],
+            theme::COLOR_TITLEBAR_TOP,
+            theme::COLOR_TITLEBAR_BOTTOM,
             [0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0,
             1.0,
+            0.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
+        // Bottom divider line for titlebar
+        push_styled_rect(
+            rect_instances,
+            [bx, by + bh - 1.0, bw, 1.0],
+            theme::DIVIDER_COLOR,
+            theme::DIVIDER_COLOR,
+            [0.0; 4],
+            [0.0; 4],
+            0.0,
+            0.0,
             0.0,
             0.0,
             [0.0, 0.0],
@@ -1694,139 +1676,208 @@ impl State {
             cx += self.ui(18.0);
         }
 
-        let max_label_chars =
-            (((bw - self.ui(176.0)).max(self.ui(160.0))) / self.cell_width).max(18.0) as usize;
-        let path_label = compact_status_message(&self.repo_context_label(), max_label_chars);
-        let label_w = path_label.chars().count() as f32 * self.cell_width;
-        let mut x = (bx + bw * 0.5 - label_w * 0.5).max(bx + self.ui(88.0));
+        // Build titlebar content: "wgit" brand + repo path + branch badge
         let baseline = by + (bh - self.line_height) * 0.5 + self.ascent;
+        let mut x = bx + self.ui(68.0); // After window controls
+
+        // Brand name
         self.append_text_run(
             text_vertices,
             &mut x,
             baseline,
-            &path_label,
-            [0.78, 0.82, 0.90, 1.0],
+            "wgit",
+            theme::TEXT_ACCENT,
         )?;
+        x += self.cell_width;
+
+        // Repo path (dimmed)
+        let repo_name = self
+            .git
+            .repo_root()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.append_text_run(
+            text_vertices,
+            &mut x,
+            baseline,
+            &repo_name,
+            theme::TEXT_SECONDARY,
+        )?;
+        x += self.cell_width * 2.0;
+
+        // Branch badge with background chip
+        let branch = self.repo_tracking.branch.clone();
+        let branch_label = format!("\u{E0A0} {}", branch); //
+        let branch_chars = branch_label.chars().count() as f32;
+        let chip_w = branch_chars * self.cell_width + self.ui(14.0);
+        let chip_h = self.line_height - self.ui(4.0);
+        let chip_y = by + (bh - chip_h) * 0.5;
+
+        push_styled_rect(
+            rect_instances,
+            [x - self.ui(7.0), chip_y, chip_w, chip_h],
+            [0.18, 0.24, 0.38, 0.70],
+            [0.14, 0.18, 0.30, 0.65],
+            theme::ACCENT_BLUE_DIM,
+            [0.0; 4],
+            self.ui(5.0),
+            1.0,
+            1.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
+        self.append_text_run(
+            text_vertices,
+            &mut x,
+            baseline,
+            &branch_label,
+            theme::ACCENT_BLUE,
+        )?;
+        x += self.cell_width;
+
+        // Ahead/behind indicators
+        if self.repo_tracking.ahead > 0 {
+            let ahead_text = format!("\u{2191}{}", self.repo_tracking.ahead);
+            self.append_text_run(
+                text_vertices,
+                &mut x,
+                baseline,
+                &ahead_text,
+                theme::ACCENT_GREEN,
+            )?;
+            x += self.cell_width;
+        }
+        if self.repo_tracking.behind > 0 {
+            let behind_text = format!("\u{2193}{}", self.repo_tracking.behind);
+            self.append_text_run(
+                text_vertices,
+                &mut x,
+                baseline,
+                &behind_text,
+                theme::ACCENT_RED,
+            )?;
+        };
 
         Ok(())
     }
 
     fn toolbar_button_configs(&self) -> Vec<ButtonConfig> {
-        let style = |fill_top, fill_bottom, stroke| ButtonStyle {
-            fill_top,
-            fill_bottom,
-            stroke,
-            text: [0.92, 0.96, 1.0, 1.0],
+        let green_btn = ButtonStyle {
+            fill_top: [0.16, 0.28, 0.20, 0.50],
+            fill_bottom: [0.12, 0.22, 0.16, 0.45],
+            stroke: [0.36, 0.68, 0.46, 0.50],
+            text: theme::ACCENT_GREEN,
+        };
+        let blue_btn = ButtonStyle {
+            fill_top: [0.16, 0.22, 0.36, 0.50],
+            fill_bottom: [0.12, 0.17, 0.28, 0.45],
+            stroke: [0.36, 0.50, 0.78, 0.50],
+            text: theme::ACCENT_BLUE,
+        };
+        let purple_btn = ButtonStyle {
+            fill_top: [0.22, 0.17, 0.34, 0.50],
+            fill_bottom: [0.17, 0.13, 0.26, 0.45],
+            stroke: [0.50, 0.40, 0.78, 0.50],
+            text: theme::ACCENT_PURPLE,
+        };
+        let yellow_btn = ButtonStyle {
+            fill_top: [0.28, 0.24, 0.14, 0.50],
+            fill_bottom: [0.22, 0.18, 0.10, 0.45],
+            stroke: [0.68, 0.56, 0.30, 0.50],
+            text: theme::ACCENT_YELLOW,
+        };
+        let red_btn = ButtonStyle {
+            fill_top: [0.32, 0.14, 0.14, 0.60],
+            fill_bottom: [0.26, 0.10, 0.10, 0.55],
+            stroke: [0.78, 0.34, 0.34, 0.60],
+            text: theme::ACCENT_RED,
+        };
+        let gray_btn = ButtonStyle {
+            fill_top: [0.18, 0.18, 0.20, 0.40],
+            fill_bottom: [0.14, 0.14, 0.16, 0.35],
+            stroke: [0.40, 0.40, 0.44, 0.35],
+            text: theme::TEXT_SECONDARY,
         };
 
         vec![
+            // ── Staging group ─────────────────────
             ButtonConfig {
-                label: String::from("[o] repos"),
-                action: ToolbarAction::RepoSwitch,
-                style: style(
-                    [0.34, 0.33, 0.20, 0.30],
-                    [0.24, 0.23, 0.14, 0.26],
-                    [0.70, 0.66, 0.38, 0.42],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[c] commit"),
-                action: ToolbarAction::Commit,
-                style: style(
-                    [0.42, 0.31, 0.17, 0.34],
-                    [0.28, 0.20, 0.10, 0.30],
-                    [0.92, 0.72, 0.36, 0.46],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[r] refresh"),
-                action: ToolbarAction::Refresh,
-                style: style(
-                    [0.27, 0.37, 0.64, 0.30],
-                    [0.20, 0.28, 0.49, 0.26],
-                    [0.52, 0.66, 0.98, 0.42],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[s] stage"),
+                label: String::from("s stage"),
                 action: ToolbarAction::Stage,
-                style: style(
-                    [0.24, 0.40, 0.30, 0.30],
-                    [0.16, 0.28, 0.21, 0.26],
-                    [0.44, 0.76, 0.54, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: green_btn,
             },
             ButtonConfig {
-                label: String::from("[a] stage all"),
+                label: String::from("a all"),
                 action: ToolbarAction::StageAll,
-                style: style(
-                    [0.20, 0.42, 0.28, 0.30],
-                    [0.14, 0.30, 0.20, 0.26],
-                    [0.40, 0.80, 0.52, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: green_btn,
             },
             ButtonConfig {
-                label: String::from("[u] unstage"),
+                label: String::from("u unstage"),
                 action: ToolbarAction::Unstage,
-                style: style(
-                    [0.42, 0.28, 0.28, 0.30],
-                    [0.32, 0.19, 0.19, 0.26],
-                    [0.86, 0.45, 0.45, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: yellow_btn,
             },
             ButtonConfig {
-                label: String::from("[U] unstage all"),
+                label: String::from("U all"),
                 action: ToolbarAction::UnstageAll,
-                style: style(
-                    [0.46, 0.26, 0.22, 0.30],
-                    [0.34, 0.18, 0.16, 0.26],
-                    [0.88, 0.53, 0.40, 0.42],
-                ),
+                group: ToolbarGroup::Staging,
+                style: yellow_btn,
+            },
+            // ── Git ops group ─────────────────────
+            ButtonConfig {
+                label: String::from("c commit"),
+                action: ToolbarAction::Commit,
+                group: ToolbarGroup::GitOps,
+                style: blue_btn,
             },
             ButtonConfig {
-                label: String::from("[x] discard"),
-                action: ToolbarAction::Discard,
-                style: style(
-                    [0.48, 0.18, 0.18, 0.30],
-                    [0.34, 0.12, 0.12, 0.26],
-                    [0.92, 0.42, 0.42, 0.42],
-                ),
-            },
-            ButtonConfig {
-                label: String::from("[f] fetch"),
+                label: String::from("f fetch"),
                 action: ToolbarAction::Fetch,
-                style: style(
-                    [0.25, 0.34, 0.48, 0.30],
-                    [0.17, 0.24, 0.36, 0.26],
-                    [0.46, 0.63, 0.84, 0.42],
-                ),
+                group: ToolbarGroup::GitOps,
+                style: purple_btn,
             },
             ButtonConfig {
-                label: String::from("[p] pull"),
+                label: String::from("p pull"),
                 action: ToolbarAction::Pull,
-                style: style(
-                    [0.25, 0.30, 0.50, 0.30],
-                    [0.18, 0.22, 0.38, 0.26],
-                    [0.49, 0.60, 0.89, 0.42],
-                ),
+                group: ToolbarGroup::GitOps,
+                style: purple_btn,
             },
             ButtonConfig {
-                label: String::from("[P] push"),
+                label: String::from("P push"),
                 action: ToolbarAction::Push,
-                style: style(
-                    [0.30, 0.25, 0.48, 0.30],
-                    [0.22, 0.17, 0.34, 0.26],
-                    [0.60, 0.52, 0.90, 0.42],
-                ),
+                group: ToolbarGroup::GitOps,
+                style: purple_btn,
+            },
+            // ── Danger group ──────────────────────
+            ButtonConfig {
+                label: String::from("x discard"),
+                action: ToolbarAction::Discard,
+                group: ToolbarGroup::Danger,
+                style: red_btn,
+            },
+            // ── App group ─────────────────────────
+            ButtonConfig {
+                label: String::from("o repos"),
+                action: ToolbarAction::RepoSwitch,
+                group: ToolbarGroup::App,
+                style: gray_btn,
             },
             ButtonConfig {
-                label: String::from("[q] quit"),
+                label: String::from("r refresh"),
+                action: ToolbarAction::Refresh,
+                group: ToolbarGroup::App,
+                style: gray_btn,
+            },
+            ButtonConfig {
+                label: String::from("q quit"),
                 action: ToolbarAction::Quit,
-                style: style(
-                    [0.30, 0.30, 0.30, 0.30],
-                    [0.20, 0.20, 0.20, 0.26],
-                    [0.56, 0.56, 0.56, 0.42],
-                ),
+                group: ToolbarGroup::App,
+                style: gray_btn,
             },
         ]
     }
@@ -1844,11 +1895,12 @@ impl State {
         let bw = bar[2];
         let bh = bar[3];
 
+        // Toolbar background
         push_styled_rect(
             rect_instances,
             bar,
-            [0.16, 0.20, 0.31, 1.0],
-            [0.12, 0.15, 0.24, 1.0],
+            theme::COLOR_TOOLBAR_TOP,
+            theme::COLOR_TOOLBAR_BOTTOM,
             [0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0,
@@ -1859,30 +1911,55 @@ impl State {
             0.0,
         );
 
+        // Bottom divider
+        push_styled_rect(
+            rect_instances,
+            [bx, by + bh - 1.0, bw, 1.0],
+            theme::DIVIDER_COLOR,
+            theme::DIVIDER_COLOR,
+            [0.0; 4],
+            [0.0; 4],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        );
+
         let mut x = bx + self.ui(14.0);
         let baseline = by + (bh - self.line_height) * 0.5 + self.ascent;
         let text_max_x = bx + bw - self.ui(14.0);
 
-        self.append_text_run(
-            text_vertices,
-            &mut x,
-            baseline,
-            "wgit",
-            [0.90, 0.95, 1.0, 1.0],
-        )?;
-        self.append_text_run(
-            text_vertices,
-            &mut x,
-            baseline,
-            &format!(
-                "  branch:{}  files:{}  ",
-                self.git.branch(),
-                self.git.entries_len()
-            ),
-            [0.80, 0.86, 0.96, 1.0],
-        )?;
+        let buttons = self.toolbar_button_configs();
+        let mut prev_group: Option<ToolbarGroup> = None;
 
-        for button in self.toolbar_button_configs() {
+        for button in buttons {
+            // Add separator between groups
+            if let Some(pg) = prev_group {
+                if pg != button.group {
+                    // Vertical separator line
+                    let sep_x = x + self.cell_width * 0.3;
+                    let sep_y = by + self.ui(10.0);
+                    let sep_h = bh - self.ui(20.0);
+                    push_styled_rect(
+                        rect_instances,
+                        [sep_x, sep_y, 1.0, sep_h],
+                        theme::TOOLBAR_SEPARATOR,
+                        theme::TOOLBAR_SEPARATOR,
+                        [0.0; 4],
+                        [0.0; 4],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
+                    x += self.cell_width * 1.2;
+                }
+            }
+
             let label_w = button.label.chars().count() as f32 * self.cell_width;
             if x + label_w + self.ui(22.0) > text_max_x {
                 break;
@@ -1890,7 +1967,7 @@ impl State {
 
             let chip_x0 = x - self.ui(6.0);
             let chip_y0 = by + self.ui(8.0);
-            let chip_w = label_w + self.ui(12.0);
+            let chip_w = label_w + self.ui(14.0);
             let chip_h = (bh - self.ui(16.0)).max(1.0);
 
             push_styled_rect(
@@ -1900,7 +1977,7 @@ impl State {
                 button.style.fill_bottom,
                 button.style.stroke,
                 [0.0, 0.0, 0.0, 0.0],
-                self.ui(7.0),
+                self.ui(6.0),
                 1.0,
                 1.0,
                 0.0,
@@ -1924,6 +2001,8 @@ impl State {
                 button.style.text,
             )?;
             x += self.cell_width;
+
+            prev_group = Some(button.group);
         }
 
         Ok(())
@@ -1971,8 +2050,8 @@ impl State {
         push_styled_rect(
             &mut rect_instances,
             content,
-            [0.09, 0.10, 0.14, 1.0],
-            [0.08, 0.09, 0.13, 1.0],
+            theme::COLOR_CONTENT_TOP,
+            theme::COLOR_CONTENT_BOTTOM,
             [0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0,
@@ -2008,46 +2087,124 @@ impl State {
 
             if Some(idx) == selected_line {
                 let y0 = y_top - self.scroll_y;
-                let y1 = y0 + self.line_height;
+                let row_h = self.line_height;
+
+                // Main selection background — brighter, more prominent
                 push_styled_rect(
                     &mut rect_instances,
                     [
                         self.ui(8.0),
-                        y0 + self.ui(1.0),
+                        y0,
                         (w - self.ui(16.0)).max(1.0),
-                        (y1 - y0 - self.ui(2.0)).max(1.0),
+                        row_h,
                     ],
                     COLOR_ROW_SELECTED,
-                    [0.32, 0.46, 0.86, 0.18],
-                    [0.50, 0.62, 0.95, 0.34],
+                    COLOR_ROW_SELECTED_BOTTOM,
+                    COLOR_ROW_SELECTED_BORDER,
                     [0.0, 0.0, 0.0, 0.0],
-                    self.ui(8.0),
+                    self.ui(6.0),
                     1.0,
                     1.0,
                     0.0,
                     [0.0, 0.0],
                     0.0,
                 );
+
+                // Left accent bar — makes selection instantly visible
+                push_styled_rect(
+                    &mut rect_instances,
+                    [self.ui(8.0), y0 + self.ui(2.0), self.ui(3.0), row_h - self.ui(4.0)],
+                    COLOR_SELECTION_ACCENT_BAR,
+                    COLOR_SELECTION_ACCENT_BAR,
+                    [0.0; 4],
+                    [0.0; 4],
+                    self.ui(1.5),
+                    0.5,
+                    0.0,
+                    0.0,
+                    [0.0, 0.0],
+                    0.0,
+                );
             }
 
-            if matches!(line_style, LineStyle::Header) && line_index > 0 {
-                let text_len = self.doc.line_text(line_index).chars().count() as f32;
-                let chip_w = (text_len * self.cell_width + self.ui(22.0))
-                    .min((w - self.ui(16.0)).max(self.ui(60.0)));
-                let chip_y = y_top - self.scroll_y + self.ui(2.0);
+            // ── Line background tints ────────────────────────
+            // Section headers, diff add/remove/hunk lines get background tints
+            if line_style.has_background() {
+                let y0 = y_top - self.scroll_y;
+                let (bg_top, bg_bottom, bg_border) = line_style.background_colors();
+
+                // Section headers get full-width strong backgrounds
+                let is_section_header = matches!(
+                    line_style,
+                    LineStyle::SectionStaged
+                        | LineStyle::SectionUnstaged
+                        | LineStyle::SectionUntracked
+                        | LineStyle::DiffFileHeader
+                );
+
+                if is_section_header {
+                    // Full-width banner with top margin
+                    let header_y = y0 - self.ui(1.0);
+                    let header_h = self.line_height + self.ui(2.0);
+                    push_styled_rect(
+                        &mut rect_instances,
+                        [
+                            self.ui(4.0),
+                            header_y,
+                            (w - self.ui(8.0)).max(1.0),
+                            header_h,
+                        ],
+                        bg_top,
+                        bg_bottom,
+                        bg_border,
+                        [0.0; 4],
+                        self.ui(4.0),
+                        1.0,
+                        1.0,
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
+                } else {
+                    // Diff line tint — subtle full-width background
+                    push_styled_rect(
+                        &mut rect_instances,
+                        [
+                            self.ui(4.0),
+                            y0,
+                            (w - self.ui(8.0)).max(1.0),
+                            self.line_height,
+                        ],
+                        bg_top,
+                        bg_bottom,
+                        bg_border,
+                        [0.0; 4],
+                        self.ui(2.0),
+                        1.0,
+                        if bg_border[3] > 0.0 { 1.0 } else { 0.0 },
+                        0.0,
+                        [0.0, 0.0],
+                        0.0,
+                    );
+                }
+            }
+
+            // Header chip (for the top-level "FILES" header only)
+            if matches!(line_style, LineStyle::Header) && line_index == 0 {
+                let y0 = y_top - self.scroll_y;
                 push_styled_rect(
                     &mut rect_instances,
                     [
-                        self.ui(8.0),
-                        chip_y,
-                        chip_w,
-                        (self.line_height - self.ui(4.0)).max(1.0),
+                        self.ui(4.0),
+                        y0,
+                        (w - self.ui(8.0)).max(1.0),
+                        self.line_height,
                     ],
-                    [0.22, 0.29, 0.46, 0.28],
-                    [0.16, 0.22, 0.36, 0.24],
-                    [0.38, 0.50, 0.84, 0.34],
-                    [0.0, 0.0, 0.0, 0.0],
-                    self.ui(7.0),
+                    [0.14, 0.18, 0.28, 0.50],
+                    [0.11, 0.14, 0.22, 0.45],
+                    theme::ACCENT_BLUE_DIM,
+                    [0.0; 4],
+                    self.ui(4.0),
                     1.0,
                     1.0,
                     0.0,

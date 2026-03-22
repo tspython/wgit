@@ -527,10 +527,13 @@ impl GitModel {
     }
 
     pub fn build_grouped_document(&mut self) -> anyhow::Result<(Document, GroupedGitViewMeta)> {
+        use crate::theme;
+
         let mut lines: Vec<DocLine> = Vec::new();
 
+        // ── FILES header (top-level) ─────────────────────────
         lines.push(DocLine {
-            text: String::from("FILES"),
+            text: String::from("  FILES"),
             style: LineStyle::Header,
             spans: Vec::new(),
         });
@@ -547,33 +550,54 @@ impl GitModel {
         ] {
             let start_line = lines.len();
             let rows = &grouped[kind.index()];
+
+            // Section header with count — uses section-specific LineStyle
+            let section_style = match kind {
+                StatusSectionKind::Staged => LineStyle::SectionStaged,
+                StatusSectionKind::Unstaged => LineStyle::SectionUnstaged,
+                StatusSectionKind::Untracked => LineStyle::SectionUntracked,
+            };
+            let header_text = format!("  {} ({})", kind.title(), rows.len());
             lines.push(DocLine {
-                text: kind.title().to_string(),
-                style: LineStyle::Header,
+                text: header_text,
+                style: section_style,
                 spans: Vec::new(),
             });
 
             if rows.is_empty() {
                 lines.push(DocLine {
-                    text: String::from("  (none)"),
+                    text: String::from("    No files"),
                     style: LineStyle::Dim,
                     spans: Vec::new(),
                 });
             } else {
                 for entry in rows.iter() {
-                    let marker = if selected_entry == Some(*entry) {
-                        ">"
-                    } else {
-                        " "
-                    };
+                    let is_selected = selected_entry == Some(*entry);
+                    let badge = theme::badge_char_for_status(&entry.xy);
+
+                    // Format: "  M  filename.rs" with badge color spans
+                    let text = format!("    {}  {}", badge, entry.path);
+
+                    // Create a color span for the badge character
+                    let badge_color = theme::badge_color_for_status(&entry.xy);
+                    let badge_start = 4; // "    " prefix
+                    let badge_end = badge_start + 1;
+
+                    // Split path into dir + filename for de-emphasis
+                    let spans = vec![ColorSpan {
+                        start_col: badge_start,
+                        end_col: badge_end,
+                        color: badge_color,
+                    }];
+
                     lines.push(DocLine {
-                        text: format!("{} {} {}", marker, entry.xy, entry.path),
-                        style: if selected_entry == Some(*entry) {
+                        text,
+                        style: if is_selected {
                             LineStyle::Selected
                         } else {
                             LineStyle::Normal
                         },
-                        spans: Vec::new(),
+                        spans,
                     });
                 }
             }
@@ -588,20 +612,22 @@ impl GitModel {
 
         let files_count = lines.len() - files_start_line;
 
+        // ── Spacer ───────────────────────────────────────────
         lines.push(DocLine {
             text: String::new(),
             style: LineStyle::Dim,
             spans: Vec::new(),
         });
 
+        // ── DIFF header ─────────────────────────────────────
         let diff_title = self
             .entries
             .get(self.selected)
-            .map(|e| format!("DIFF {}", e.path))
-            .unwrap_or_else(|| String::from("DIFF"));
+            .map(|e| format!("  DIFF  {}", e.path))
+            .unwrap_or_else(|| String::from("  DIFF"));
         lines.push(DocLine {
             text: diff_title,
-            style: LineStyle::Header,
+            style: LineStyle::DiffFileHeader,
             spans: Vec::new(),
         });
 
@@ -1165,13 +1191,14 @@ fn style_for_diff_line(line: &str) -> LineStyle {
         LineStyle::DiffAdd
     } else if line.starts_with('-') && !line.starts_with("---") {
         LineStyle::DiffRemove
-    } else if line.starts_with("diff --git")
-        || line.starts_with("index ")
+    } else if line.starts_with("diff --git") {
+        LineStyle::DiffFileHeader
+    } else if line.starts_with("index ")
         || line.starts_with("--- ")
         || line.starts_with("+++ ")
         || line.starts_with("# ")
     {
-        LineStyle::Dim
+        LineStyle::DiffMeta
     } else {
         LineStyle::Normal
     }
@@ -1280,11 +1307,11 @@ not a status line
         ));
         assert!(matches!(
             style_for_diff_line("+++ b/src/lib.rs"),
-            LineStyle::Dim
+            LineStyle::DiffMeta
         ));
         assert!(matches!(
             style_for_diff_line("index 123..456"),
-            LineStyle::Dim
+            LineStyle::DiffMeta
         ));
     }
 
