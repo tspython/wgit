@@ -1933,13 +1933,16 @@ impl State {
 
         let buttons = self.toolbar_button_configs();
         let mut prev_group: Option<ToolbarGroup> = None;
+        let chip_pad_h = self.ui(8.0); // horizontal padding inside chip, each side
+        let chip_gap = self.ui(4.0); // gap between chips in same group
+        let group_gap = self.ui(14.0); // gap between groups (including separator)
 
         for button in buttons {
             // Add separator between groups
             if let Some(pg) = prev_group {
                 if pg != button.group {
                     // Vertical separator line between button groups
-                    let sep_x = x;
+                    let sep_x = x + (group_gap * 0.5);
                     let sep_y = by + self.ui(12.0);
                     let sep_h = bh - self.ui(24.0);
                     push_styled_rect(
@@ -1956,18 +1959,21 @@ impl State {
                         [0.0, 0.0],
                         0.0,
                     );
-                    x += self.ui(10.0);
+                    x += group_gap;
+                } else {
+                    x += chip_gap;
                 }
             }
 
             let label_w = button.label.chars().count() as f32 * self.cell_width;
-            if x + label_w + self.ui(22.0) > text_max_x {
+            let chip_w = label_w + chip_pad_h * 2.0;
+
+            if x + chip_w > text_max_x {
                 break;
             }
 
-            let chip_x0 = x - self.ui(6.0);
+            let chip_x0 = x;
             let chip_y0 = by + self.ui(8.0);
-            let chip_w = label_w + self.ui(14.0);
             let chip_h = (bh - self.ui(16.0)).max(1.0);
 
             push_styled_rect(
@@ -1993,15 +1999,18 @@ impl State {
                 action: button.action,
             });
 
+            // Position text centered inside the chip
+            let mut text_x = chip_x0 + chip_pad_h;
             self.append_text_run(
                 text_vertices,
-                &mut x,
+                &mut text_x,
                 baseline,
                 &button.label,
                 button.style.text,
             )?;
-            // Advance past the chip right padding (ui(8)) plus gap between chips
-            x += self.ui(12.0);
+
+            // Advance x to the right edge of the chip
+            x = chip_x0 + chip_w;
 
             prev_group = Some(button.group);
         }
