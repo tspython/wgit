@@ -239,11 +239,11 @@ impl State {
 
         let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("./text.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../text.wgsl").into()),
         });
         let rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rect_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("./rect.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../rect.wgsl").into()),
         });
 
         let text_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3079,7 +3079,7 @@ fn load_primary_font() -> anyhow::Result<FontArc> {
         }
     }
 
-    FontArc::try_from_slice(include_bytes!("../data/fonts/Terminus.ttf"))
+    FontArc::try_from_slice(include_bytes!("../../data/fonts/Terminus.ttf"))
         .context("failed to load built-in Terminus.ttf")
 }
 
