@@ -15,3 +15,5 @@ gix = { version = "0.67.0", default-features = false }
 tree-sitter = "0.25.10"
 tree-sitter-rust = "0.24.0"
 tree-sitter-toml-ng = "0.7.0"
+log = "0.4"
+notify = "7.0.0"

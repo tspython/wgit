@@ -1,13 +1,14 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 
 use ab_glyph::{Font, FontArc, Glyph, GlyphId, PxScale, ScaleFont, point};
 use anyhow::Context;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
@@ -27,6 +28,15 @@ use crate::theme::{
     COLOR_ROW_SELECTED_BOTTOM, COLOR_SELECTION_ACCENT_BAR, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP,
     STATUS_BAR_HEIGHT, STATUS_BAR_SIDE_PADDING, TOP_PADDING,
 };
+
+/// Minimum interval between shader-watcher-triggered reloads (ms).
+const SHADER_DEBOUNCE_MS: u128 = 300;
+
+#[derive(Debug)]
+pub enum AppEvent {
+    /// A `.wgsl` shader file was modified on disk.
+    ShaderChanged,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum StatusKind {
@@ -76,6 +86,9 @@ struct State {
 
     text_pipeline: wgpu::RenderPipeline,
     rect_pipeline: wgpu::RenderPipeline,
+    // Stored for shader hot-reload (recreating pipelines).
+    text_pipeline_layout: wgpu::PipelineLayout,
+    rect_pipeline_layout: wgpu::PipelineLayout,
     text_bg: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
@@ -127,6 +140,11 @@ struct State {
 
     layout_dirty: bool,
     geometry_dirty: bool,
+
+    /// Directory containing .wgsl shader files (for runtime reloading).
+    shader_dir: PathBuf,
+    /// Last time shaders were hot-reloaded (for debouncing).
+    last_shader_reload: Instant,
 }
 
 impl State {
@@ -237,15 +255,6 @@ impl State {
             }],
         });
 
-        let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("text_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("./text.wgsl").into()),
-        });
-        let rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rect_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("./rect.wgsl").into()),
-        });
-
         let text_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("text_pl"),
             bind_group_layouts: &[&text_bgl, &uniform_bgl],
@@ -257,130 +266,13 @@ impl State {
             push_constant_ranges: &[],
         });
 
+        // Resolve shader directory: try the source tree first (for dev hot-reload),
+        // then fall back to the compiled-in shaders.
+        let shader_dir = locate_shader_dir();
         let target_format = surface_format.add_srgb_suffix();
 
-        let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("text_pipeline"),
-            layout: Some(&text_pl),
-            vertex: wgpu::VertexState {
-                module: &text_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<TextVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 16,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Float32x4,
-                        },
-                    ],
-                }],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &text_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
-
-        let rect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rect_pipeline"),
-            layout: Some(&rect_pl),
-            vertex: wgpu::VertexState {
-                module: &rect_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<QuadVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        }],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<StyledRectInstance>() as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                offset: 0,
-                                shader_location: 1,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 16,
-                                shader_location: 2,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 32,
-                                shader_location: 3,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 48,
-                                shader_location: 4,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 64,
-                                shader_location: 5,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 80,
-                                shader_location: 6,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 96,
-                                shader_location: 7,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                        ],
-                    },
-                ],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &rect_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let (text_pipeline, rect_pipeline) =
+            create_pipelines(&device, &text_pl, &rect_pl, target_format, &shader_dir)?;
 
         let empty_text_vbuf = create_empty_buffer(
             &device,
@@ -412,6 +304,8 @@ impl State {
             surface_format,
             text_pipeline,
             rect_pipeline,
+            text_pipeline_layout: text_pl,
+            rect_pipeline_layout: rect_pl,
             text_bg,
             uniform_buf,
             uniform_bg,
@@ -453,6 +347,8 @@ impl State {
             rect_instance_count: 0,
             layout_dirty: true,
             geometry_dirty: true,
+            shader_dir,
+            last_shader_reload: Instant::now(),
         };
 
         state.configure_surface();
@@ -478,6 +374,22 @@ impl State {
             present_mode: wgpu::PresentMode::AutoVsync,
         };
         self.surface.configure(&self.device, &config);
+    }
+
+    /// Hot-reload shaders from disk and recreate GPU pipelines.
+    fn reload_shaders(&mut self) -> anyhow::Result<()> {
+        let target_format = self.surface_format.add_srgb_suffix();
+        let (text_pipeline, rect_pipeline) = create_pipelines(
+            &self.device,
+            &self.text_pipeline_layout,
+            &self.rect_pipeline_layout,
+            target_format,
+            &self.shader_dir,
+        )?;
+        self.text_pipeline = text_pipeline;
+        self.rect_pipeline = rect_pipeline;
+        self.geometry_dirty = true;
+        Ok(())
     }
 
     fn ui(&self, value: f32) -> f32 {
@@ -2825,18 +2737,51 @@ impl State {
 pub struct App {
     state: Option<State>,
     git: Option<GitModel>,
+    proxy: EventLoopProxy<AppEvent>,
+    _shader_watcher: Option<RecommendedWatcher>,
 }
 
 impl App {
-    fn new(git: GitModel) -> Self {
+    fn new(git: GitModel, proxy: EventLoopProxy<AppEvent>) -> Self {
         Self {
             state: None,
             git: Some(git),
+            proxy,
+            _shader_watcher: None,
         }
+    }
+
+    /// Start the file-system watcher for `.wgsl` shader files.
+    fn start_shader_watcher(&mut self, shader_dir: &std::path::Path) {
+        let proxy = self.proxy.clone();
+        let mut watcher = match notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(ev) = res {
+                    let is_wgsl = ev.paths.iter().any(|p| {
+                        p.extension().is_some_and(|ext| ext == "wgsl")
+                    });
+                    if is_wgsl && !matches!(ev.kind, notify::EventKind::Access(_)) {
+                        let _ = proxy.send_event(AppEvent::ShaderChanged);
+                    }
+                }
+            },
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                log::warn!("Failed to create shader watcher: {err}");
+                self._shader_watcher = None;
+                return;
+            }
+        };
+
+        if let Err(err) = watcher.watch(shader_dir, RecursiveMode::NonRecursive) {
+            log::warn!("Failed to watch {}: {err}", shader_dir.display());
+        }
+        self._shader_watcher = Some(watcher);
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("wgit")
@@ -2845,8 +2790,39 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let git = self.git.take().expect("git model available");
         let state = pollster::block_on(State::new(window.clone(), git)).expect("init state");
+        let shader_dir = state.shader_dir.clone();
         self.state = Some(state);
+        self.start_shader_watcher(&shader_dir);
         window.request_redraw();
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            AppEvent::ShaderChanged => {
+                let now = Instant::now();
+                if now.duration_since(st.last_shader_reload).as_millis() < SHADER_DEBOUNCE_MS {
+                    return;
+                }
+                st.last_shader_reload = now;
+
+                match st.reload_shaders() {
+                    Ok(()) => {
+                        st.set_status(StatusKind::Success, "Shaders hot-reloaded");
+                        st.window.request_redraw();
+                    }
+                    Err(err) => {
+                        st.set_status(
+                            StatusKind::Error,
+                            format!("Shader reload failed: {err}"),
+                        );
+                        st.window.request_redraw();
+                    }
+                }
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -2998,9 +2974,12 @@ impl ApplicationHandler for App {
 }
 
 pub fn run(git: GitModel) -> anyhow::Result<()> {
-    let event_loop = EventLoop::new().expect("event loop");
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(git);
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(git, proxy);
     event_loop.run_app(&mut app).expect("run app");
     Ok(())
 }
@@ -3079,6 +3058,193 @@ fn load_primary_font() -> anyhow::Result<FontArc> {
 
     FontArc::try_from_slice(include_bytes!("../data/fonts/Terminus.ttf"))
         .context("failed to load built-in Terminus.ttf")
+}
+
+/// Locate the directory containing `.wgsl` shader files.
+///
+/// In development, this is `src/` next to Cargo.toml. When running a release
+/// binary, the shaders were compiled in so this path may not exist — in that
+/// case we return a dummy path and `load_shader_source` will fall back to the
+/// built-in shaders.
+fn locate_shader_dir() -> PathBuf {
+    // Check relative to the executable first, then relative to CWD.
+    let candidates = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("../../src")))
+            .unwrap_or_default(),
+        PathBuf::from("src"),
+    ];
+
+    for dir in &candidates {
+        if dir.join("text.wgsl").exists() {
+            return dir.clone();
+        }
+    }
+
+    // Fallback: use "src" — load_shader_source will use include_str! defaults.
+    PathBuf::from("src")
+}
+
+/// Load a shader source from disk, falling back to the compiled-in version.
+fn load_shader_source(shader_dir: &std::path::Path, filename: &str, builtin: &str) -> String {
+    let path = shader_dir.join(filename);
+    match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(_) => {
+            log::info!(
+                "Shader {filename} not found at {}, using built-in",
+                path.display()
+            );
+            builtin.to_string()
+        }
+    }
+}
+
+/// Create the text and rect render pipelines from the current shader sources.
+fn create_pipelines(
+    device: &wgpu::Device,
+    text_pl: &wgpu::PipelineLayout,
+    rect_pl: &wgpu::PipelineLayout,
+    target_format: wgpu::TextureFormat,
+    shader_dir: &std::path::Path,
+) -> anyhow::Result<(wgpu::RenderPipeline, wgpu::RenderPipeline)> {
+    let text_source = load_shader_source(shader_dir, "text.wgsl", include_str!("./text.wgsl"));
+    let rect_source = load_shader_source(shader_dir, "rect.wgsl", include_str!("./rect.wgsl"));
+
+    let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("text_shader"),
+        source: wgpu::ShaderSource::Wgsl(text_source.into()),
+    });
+    let rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("rect_shader"),
+        source: wgpu::ShaderSource::Wgsl(rect_source.into()),
+    });
+
+    let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("text_pipeline"),
+        layout: Some(text_pl),
+        vertex: wgpu::VertexState {
+            module: &text_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<TextVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 8,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 16,
+                        shader_location: 2,
+                        format: wgpu::VertexFormat::Float32x4,
+                    },
+                ],
+            }],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &text_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    let rect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("rect_pipeline"),
+        layout: Some(rect_pl),
+        vertex: wgpu::VertexState {
+            module: &rect_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<QuadVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<StyledRectInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 16,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 32,
+                            shader_location: 3,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 48,
+                            shader_location: 4,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 64,
+                            shader_location: 5,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 80,
+                            shader_location: 6,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 96,
+                            shader_location: 7,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                    ],
+                },
+            ],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &rect_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    Ok((text_pipeline, rect_pipeline))
 }
 
 #[cfg(test)]
