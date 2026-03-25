@@ -1,13 +1,14 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 
 use ab_glyph::{Font, FontArc, Glyph, GlyphId, PxScale, ScaleFont, point};
 use anyhow::Context;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
@@ -27,6 +28,15 @@ use crate::theme::{
     COLOR_ROW_SELECTED_BOTTOM, COLOR_SELECTION_ACCENT_BAR, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP,
     STATUS_BAR_HEIGHT, STATUS_BAR_SIDE_PADDING, TOP_PADDING,
 };
+
+/// Minimum interval between file-watcher-triggered refreshes.
+const WATCHER_DEBOUNCE_MS: u128 = 500;
+
+#[derive(Debug)]
+pub enum AppEvent {
+    /// The file system watcher detected changes in the repository.
+    FsChanged,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum StatusKind {
@@ -127,6 +137,12 @@ struct State {
 
     layout_dirty: bool,
     geometry_dirty: bool,
+
+    /// Last time a file-watcher refresh was processed (for debouncing).
+    last_fs_refresh: Instant,
+
+    /// Set when the repo root changes so the watcher can be restarted.
+    watcher_needs_restart: bool,
 }
 
 impl State {
@@ -453,6 +469,8 @@ impl State {
             rect_instance_count: 0,
             layout_dirty: true,
             geometry_dirty: true,
+            last_fs_refresh: Instant::now(),
+            watcher_needs_restart: false,
         };
 
         state.configure_surface();
@@ -742,6 +760,7 @@ impl State {
         self.refresh_recent_repos();
         self.refresh_document_from_git()?;
         self.input_mode = InputMode::Normal;
+        self.watcher_needs_restart = true;
         self.set_status(
             StatusKind::Success,
             format!("Opened repository {}", self.git.repo_root().display()),
@@ -2825,18 +2844,54 @@ impl State {
 pub struct App {
     state: Option<State>,
     git: Option<GitModel>,
+    proxy: EventLoopProxy<AppEvent>,
+    _watcher: Option<RecommendedWatcher>,
 }
 
 impl App {
-    fn new(git: GitModel) -> Self {
+    fn new(git: GitModel, proxy: EventLoopProxy<AppEvent>) -> Self {
         Self {
             state: None,
             git: Some(git),
+            proxy,
+            _watcher: None,
         }
+    }
+
+    /// Start (or restart) the file-system watcher for the current repo root.
+    fn start_watcher(&mut self, repo_root: &std::path::Path) {
+        let proxy = self.proxy.clone();
+        let mut watcher = match notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(ev) = res {
+                    // Only trigger on content/metadata changes, creates, removes, renames.
+                    // Ignore pure access events to reduce noise.
+                    let dominated = matches!(
+                        ev.kind,
+                        notify::EventKind::Access(_)
+                    );
+                    if !dominated {
+                        let _ = proxy.send_event(AppEvent::FsChanged);
+                    }
+                }
+            },
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                log::warn!("Failed to create file watcher: {err}");
+                self._watcher = None;
+                return;
+            }
+        };
+
+        if let Err(err) = watcher.watch(repo_root, RecursiveMode::Recursive) {
+            log::warn!("Failed to watch {}: {err}", repo_root.display());
+        }
+        self._watcher = Some(watcher);
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("wgit")
@@ -2844,9 +2899,36 @@ impl ApplicationHandler for App {
             .with_transparent(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let git = self.git.take().expect("git model available");
+        let repo_root = git.repo_root().to_path_buf();
         let state = pollster::block_on(State::new(window.clone(), git)).expect("init state");
         self.state = Some(state);
+        self.start_watcher(&repo_root);
         window.request_redraw();
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            AppEvent::FsChanged => {
+                let now = Instant::now();
+                if now.duration_since(st.last_fs_refresh).as_millis() < WATCHER_DEBOUNCE_MS {
+                    return;
+                }
+                st.last_fs_refresh = now;
+
+                if let Err(err) = st.git.refresh() {
+                    log::warn!("File-watcher refresh failed: {err}");
+                    return;
+                }
+                if let Err(err) = st.refresh_document_from_git() {
+                    log::warn!("File-watcher document rebuild failed: {err}");
+                    return;
+                }
+                st.window.request_redraw();
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -2994,13 +3076,30 @@ impl ApplicationHandler for App {
         if needs_redraw {
             st.window.request_redraw();
         }
+
+        // Restart the file watcher if the repo root changed.
+        // Done after releasing the `st` borrow above.
+        let restart_root = self
+            .state
+            .as_mut()
+            .filter(|s| s.watcher_needs_restart)
+            .map(|s| {
+                s.watcher_needs_restart = false;
+                s.git.repo_root().to_path_buf()
+            });
+        if let Some(root) = restart_root {
+            self.start_watcher(&root);
+        }
     }
 }
 
 pub fn run(git: GitModel) -> anyhow::Result<()> {
-    let event_loop = EventLoop::new().expect("event loop");
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(git);
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(git, proxy);
     event_loop.run_app(&mut app).expect("run app");
     Ok(())
 }
