@@ -1,0 +1,5 @@
+[alias]
+# Hot-reload development mode: rebuilds and restarts on Rust code changes.
+# Requires: cargo install cargo-watch
+# Usage: cargo dev
+dev = ["watch", "-x", "run", "-w", "src"]
