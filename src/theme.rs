@@ -112,14 +112,6 @@ pub const MODAL_DANGER_BG_TOP: [f32; 4] = [0.20, 0.12, 0.12, 1.0];
 pub const MODAL_DANGER_BG_BOTTOM: [f32; 4] = [0.14, 0.08, 0.08, 1.0];
 pub const MODAL_DANGER_BORDER: [f32; 4] = [0.80, 0.35, 0.35, 0.60];
 
-// ── Folder browser ──────────────────────────────────────────────
-/// Badge shown next to directories that contain a git repo
-pub const FOLDER_GIT_BADGE: [f32; 4] = [0.40, 0.82, 0.52, 0.90];
-/// Color for the current path breadcrumb
-pub const FOLDER_PATH_TEXT: [f32; 4] = [0.55, 0.70, 1.0, 1.0];
-/// Color for directory icon/prefix
-pub const FOLDER_DIR_ICON: [f32; 4] = [0.72, 0.76, 0.84, 1.0];
-
 // ── Branch switcher ─────────────────────────────────────────────
 /// Current branch indicator
 pub const BRANCH_CURRENT_BADGE: [f32; 4] = [0.40, 0.82, 0.52, 1.0];

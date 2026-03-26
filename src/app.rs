@@ -63,14 +63,7 @@ enum InputMode {
     CommitBody,
     RepoPicker,
     DiscardConfirm,
-    FolderBrowser,
     BranchSwitcher,
-}
-
-#[derive(Clone, Debug)]
-struct FolderEntry {
-    name: String,
-    is_git: bool,
 }
 
 struct State {
@@ -123,13 +116,6 @@ struct State {
     repo_picker_index: usize,
     repo_picker_scroll: usize,
     pending_discard_path: Option<PathBuf>,
-
-    // ── Folder browser ────────────────────────────────────────
-    folder_browser_path: PathBuf,
-    folder_browser_entries: Vec<FolderEntry>,
-    folder_browser_index: usize,
-    folder_browser_scroll: usize,
-    folder_browser_show_hidden: bool,
 
     // ── Branch switcher ───────────────────────────────────────
     branch_list: Vec<String>,
@@ -465,11 +451,6 @@ impl State {
             repo_picker_index: 0,
             repo_picker_scroll: 0,
             pending_discard_path: None,
-            folder_browser_path: PathBuf::from("/"),
-            folder_browser_entries: Vec::new(),
-            folder_browser_index: 0,
-            folder_browser_scroll: 0,
-            folder_browser_show_hidden: false,
             branch_list: Vec::new(),
             branch_current: String::new(),
             branch_picker_index: 0,
@@ -665,7 +646,6 @@ impl State {
         self.commit_summary.clear();
         self.commit_body.clear();
         self.pending_discard_path = None;
-        self.folder_browser_entries.clear();
         self.branch_list.clear();
         self.set_selection_status();
     }
@@ -922,150 +902,33 @@ impl State {
         }
     }
 
-    // ── Folder browser ─────────────────────────────────────────────
+    // ── Folder browser (native OS dialog) ─────────────────────────
 
-    fn prompt_folder_browser(&mut self) {
-        self.folder_browser_path = self.git.repo_root().parent()
+    fn open_folder_dialog(&mut self) -> anyhow::Result<()> {
+        let start_dir = self.git.repo_root().parent()
             .unwrap_or_else(|| std::path::Path::new("/"))
             .to_path_buf();
-        self.folder_browser_index = 0;
-        self.folder_browser_scroll = 0;
-        self.refresh_folder_browser_entries();
-        self.input_mode = InputMode::FolderBrowser;
-        self.update_folder_browser_prompt();
-    }
 
-    fn refresh_folder_browser_entries(&mut self) {
-        let mut entries = Vec::new();
-        if let Ok(read_dir) = fs::read_dir(&self.folder_browser_path) {
-            for entry in read_dir.flatten() {
-                let Ok(ft) = entry.file_type() else { continue };
-                if !ft.is_dir() { continue; }
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !self.folder_browser_show_hidden && name.starts_with('.') {
-                    continue;
-                }
-                let is_git = entry.path().join(".git").exists();
-                entries.push(FolderEntry { name, is_git });
-            }
-        }
-        entries.sort_by(|a, b| {
-            b.is_git.cmp(&a.is_git).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        self.folder_browser_entries = entries;
-        self.folder_browser_index = 0;
-        self.folder_browser_scroll = 0;
-    }
+        let picked = rfd::FileDialog::new()
+            .set_title("Open Git Repository")
+            .set_directory(&start_dir)
+            .pick_folder();
 
-    fn update_folder_browser_prompt(&mut self) {
-        let path = self.folder_browser_path.display().to_string();
-        let message = format!(
-            "Browse: {}  [Enter] open  [Backspace] up  [.] toggle hidden  [Esc] cancel",
-            compact_status_message(&path, 48)
-        );
-        self.set_status(StatusKind::Prompt, message);
-    }
-
-    fn set_folder_browser_index(&mut self, index: usize) {
-        if self.folder_browser_entries.is_empty() {
-            self.folder_browser_index = 0;
-            self.folder_browser_scroll = 0;
-            return;
-        }
-        let last = self.folder_browser_entries.len() - 1;
-        self.folder_browser_index = index.min(last);
-        let visible = 8usize;
-        if self.folder_browser_index < self.folder_browser_scroll {
-            self.folder_browser_scroll = self.folder_browser_index;
-        } else if self.folder_browser_index >= self.folder_browser_scroll + visible {
-            self.folder_browser_scroll = self.folder_browser_index + 1 - visible;
-        }
-    }
-
-    fn folder_browser_enter(&mut self) -> anyhow::Result<()> {
-        let Some(entry) = self.folder_browser_entries.get(self.folder_browser_index).cloned() else {
-            return Ok(());
+        let Some(path) = picked else {
+            return Ok(()); // user cancelled
         };
-        let target = self.folder_browser_path.join(&entry.name);
-        if entry.is_git {
-            // Open as repo
-            let git = GitModel::open_at(&target)
-                .with_context(|| format!("failed to open repository at {}", target.display()))?;
-            self.git = git;
-            let _ = repo_store::remember_repo(self.git.repo_root());
-            self.refresh_recent_repos();
-            self.refresh_document_from_git()?;
-            self.input_mode = InputMode::Normal;
-            self.folder_browser_entries.clear();
-            self.set_status(
-                StatusKind::Success,
-                format!("Opened repository {}", self.git.repo_root().display()),
-            );
-        } else {
-            // Descend into directory
-            self.folder_browser_path = target;
-            self.refresh_folder_browser_entries();
-            self.update_folder_browser_prompt();
-        }
+
+        let git = GitModel::open_at(&path)
+            .with_context(|| format!("{} is not a git repository", path.display()))?;
+        self.git = git;
+        let _ = repo_store::remember_repo(self.git.repo_root());
+        self.refresh_recent_repos();
+        self.refresh_document_from_git()?;
+        self.set_status(
+            StatusKind::Success,
+            format!("Opened repository {}", self.git.repo_root().display()),
+        );
         Ok(())
-    }
-
-    fn folder_browser_go_up(&mut self) {
-        if let Some(parent) = self.folder_browser_path.parent() {
-            self.folder_browser_path = parent.to_path_buf();
-            self.refresh_folder_browser_entries();
-            self.update_folder_browser_prompt();
-        }
-    }
-
-    fn handle_folder_browser_input(&mut self, key: &Key) -> anyhow::Result<bool> {
-        match key {
-            Key::Named(NamedKey::Escape) => {
-                self.cancel_input_mode();
-                Ok(true)
-            }
-            Key::Named(NamedKey::Enter) => {
-                self.folder_browser_enter()?;
-                Ok(true)
-            }
-            Key::Named(NamedKey::Backspace) => {
-                self.folder_browser_go_up();
-                Ok(true)
-            }
-            Key::Named(NamedKey::ArrowUp) => {
-                if self.folder_browser_index > 0 {
-                    self.set_folder_browser_index(self.folder_browser_index - 1);
-                    self.update_folder_browser_prompt();
-                }
-                Ok(true)
-            }
-            Key::Named(NamedKey::ArrowDown) => {
-                if self.folder_browser_index + 1 < self.folder_browser_entries.len() {
-                    self.set_folder_browser_index(self.folder_browser_index + 1);
-                    self.update_folder_browser_prompt();
-                }
-                Ok(true)
-            }
-            Key::Named(NamedKey::Home) => {
-                self.set_folder_browser_index(0);
-                self.update_folder_browser_prompt();
-                Ok(true)
-            }
-            Key::Named(NamedKey::End) => {
-                if !self.folder_browser_entries.is_empty() {
-                    self.set_folder_browser_index(self.folder_browser_entries.len() - 1);
-                    self.update_folder_browser_prompt();
-                }
-                Ok(true)
-            }
-            Key::Character(ch) if ch.as_ref() == "." => {
-                self.folder_browser_show_hidden = !self.folder_browser_show_hidden;
-                self.refresh_folder_browser_entries();
-                self.update_folder_browser_prompt();
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
     }
 
     // ── Branch switcher ─────────────────────────────────────────────
@@ -1198,7 +1061,7 @@ impl State {
                 Ok(true)
             }
             ToolbarAction::Browse => {
-                self.prompt_folder_browser();
+                self.open_folder_dialog()?;
                 Ok(true)
             }
             ToolbarAction::BranchSwitch => {
@@ -1362,9 +1225,6 @@ impl State {
             }
             InputMode::DiscardConfirm => {
                 self.build_discard_overlay_geometry(text_vertices, rect_instances)
-            }
-            InputMode::FolderBrowser => {
-                self.build_folder_browser_overlay_geometry(text_vertices, rect_instances)
             }
             InputMode::BranchSwitcher => {
                 self.build_branch_switcher_overlay_geometry(text_vertices, rect_instances)
@@ -1659,142 +1519,6 @@ impl State {
             hint_y + self.ascent,
             "Enter / y confirm  Esc cancel",
             [1.0, 0.84, 0.84, 1.0],
-        )?;
-
-        Ok(())
-    }
-
-    fn build_folder_browser_overlay_geometry(
-        &mut self,
-        text_vertices: &mut Vec<TextVertex>,
-        rect_instances: &mut Vec<StyledRectInstance>,
-    ) -> anyhow::Result<()> {
-        let visible_start = self.folder_browser_scroll.min(self.folder_browser_entries.len());
-        let visible_end = (visible_start + 8).min(self.folder_browser_entries.len());
-        let visible_count = visible_end.saturating_sub(visible_start);
-        let panel_h = self.ui(108.0) + visible_count as f32 * (self.line_height + self.ui(6.0));
-        let panel = self.modal_panel_rect(panel_h);
-        push_styled_rect(
-            rect_instances,
-            panel,
-            theme::MODAL_BG_TOP,
-            theme::MODAL_BG_BOTTOM,
-            theme::MODAL_BORDER,
-            [0.0, 0.0, 0.0, 0.28],
-            self.ui(12.0),
-            1.0,
-            1.0,
-            self.ui(16.0),
-            [0.0, self.ui(4.0)],
-            self.ui(2.0),
-        );
-
-        // Title
-        let mut x = panel[0] + self.ui(16.0);
-        let mut y = panel[1] + self.ui(18.0);
-        self.append_text_run(
-            text_vertices,
-            &mut x,
-            y + self.ascent,
-            "Open folder",
-            [0.92, 0.96, 1.0, 1.0],
-        )?;
-
-        // Current path breadcrumb
-        y += self.line_height * 1.1;
-        let max_path_chars = ((panel[2] - self.ui(32.0)) / self.cell_width).max(1.0) as usize;
-        let mut px = panel[0] + self.ui(16.0);
-        self.append_text_run(
-            text_vertices,
-            &mut px,
-            y + self.ascent,
-            &compact_status_message(&self.folder_browser_path.display().to_string(), max_path_chars),
-            theme::FOLDER_PATH_TEXT,
-        )?;
-
-        y += self.line_height * 1.2;
-        let row_x = panel[0] + self.ui(14.0);
-        let row_w = panel[2] - self.ui(28.0);
-
-        if self.folder_browser_entries.is_empty() {
-            let mut ex = row_x + self.ui(10.0);
-            self.append_text_run(
-                text_vertices,
-                &mut ex,
-                y + self.ascent,
-                "(empty directory)",
-                theme::TEXT_MUTED,
-            )?;
-        } else {
-            let visible_entries: Vec<FolderEntry> =
-                self.folder_browser_entries[visible_start..visible_end].to_vec();
-            for (offset, entry) in visible_entries.iter().enumerate() {
-                let idx = visible_start + offset;
-                let row_y = y + offset as f32 * (self.line_height + self.ui(6.0));
-                let selected = idx == self.folder_browser_index;
-                let (fill_top, fill_bottom, stroke) = if selected {
-                    (
-                        [0.25, 0.33, 0.50, 1.0],
-                        [0.18, 0.24, 0.38, 1.0],
-                        [0.52, 0.68, 0.98, 0.70],
-                    )
-                } else {
-                    (
-                        [0.16, 0.18, 0.26, 1.0],
-                        [0.12, 0.14, 0.20, 1.0],
-                        [0.30, 0.36, 0.48, 0.40],
-                    )
-                };
-                push_styled_rect(
-                    rect_instances,
-                    [row_x, row_y, row_w, self.line_height + self.ui(4.0)],
-                    fill_top,
-                    fill_bottom,
-                    stroke,
-                    [0.0, 0.0, 0.0, 0.0],
-                    self.ui(8.0),
-                    1.0,
-                    1.0,
-                    0.0,
-                    [0.0, 0.0],
-                    0.0,
-                );
-
-                let mut tx = row_x + self.ui(10.0);
-                let label = if entry.is_git {
-                    format!("\u{25CF} {}", entry.name)
-                } else {
-                    format!("  {}", entry.name)
-                };
-                let text_color = if entry.is_git {
-                    if selected { [1.0, 1.0, 1.0, 1.0] } else { theme::FOLDER_GIT_BADGE }
-                } else if selected {
-                    [1.0, 1.0, 1.0, 1.0]
-                } else {
-                    [0.86, 0.90, 0.96, 1.0]
-                };
-                self.append_text_run(
-                    text_vertices,
-                    &mut tx,
-                    row_y + self.ascent + 2.0,
-                    &compact_status_message(
-                        &label,
-                        ((row_w - self.ui(20.0)) / self.cell_width).max(1.0) as usize,
-                    ),
-                    text_color,
-                )?;
-            }
-        }
-
-        // Hint text
-        let mut hint_x = panel[0] + self.ui(16.0);
-        let hint_y = panel[1] + panel[3] - self.line_height + self.ui(4.0);
-        self.append_text_run(
-            text_vertices,
-            &mut hint_x,
-            hint_y + self.ascent,
-            "Enter open  Backspace up  . hidden  Esc cancel",
-            [0.76, 0.82, 0.92, 1.0],
         )?;
 
         Ok(())
@@ -3501,9 +3225,6 @@ impl ApplicationHandler for App {
                             InputMode::DiscardConfirm => {
                                 st.handle_discard_confirm_input(&event.logical_key)
                             }
-                            InputMode::FolderBrowser => {
-                                st.handle_folder_browser_input(&event.logical_key)
-                            }
                             InputMode::BranchSwitcher => {
                                 st.handle_branch_switcher_input(&event.logical_key)
                             }
@@ -3539,7 +3260,6 @@ impl ApplicationHandler for App {
                                 }
                                 InputMode::RepoPicker => "Repo switch failed",
                                 InputMode::DiscardConfirm => "Discard failed",
-                                InputMode::FolderBrowser => "Folder browser failed",
                                 InputMode::BranchSwitcher => "Branch switch failed",
                                 InputMode::Normal => "Input handling failed",
                             };
