@@ -6,10 +6,10 @@ use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
-    window::{Window, WindowId},
+    window::{CursorIcon, Window, WindowId},
 };
 
 use crate::git_model::{BranchTrackingStatus, GitModel, GroupedGitViewMeta};
@@ -126,6 +126,13 @@ struct State {
     mouse_pos: PhysicalPosition<f64>,
     window_controls: Vec<WindowControlButton>,
     toolbar_buttons: Vec<ToolbarButton>,
+
+    // ── Panel split ratio ────────────────────────────────
+    file_pane_ratio: f32,
+    divider_dragging: bool,
+
+    // ── Zoom ─────────────────────────────────────────────
+    zoom_level: f32,
 
     text_vbuf: wgpu::Buffer,
     text_vcount: u32,
@@ -458,6 +465,9 @@ impl State {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             window_controls: Vec::new(),
             toolbar_buttons: Vec::new(),
+            file_pane_ratio: 0.30,
+            divider_dragging: false,
+            zoom_level: 1.0,
             text_vbuf: empty_text_vbuf,
             text_vcount: 0,
             rect_unit_vbuf,
@@ -521,7 +531,7 @@ impl State {
     }
 
     fn refresh_ui_scale(&mut self) {
-        self.ui_scale = compute_ui_scale(self.window.scale_factor(), self.size);
+        self.ui_scale = compute_ui_scale(self.window.scale_factor(), self.size) * self.zoom_level;
         self.compute_font_metrics();
         self.layout_dirty = true;
         self.geometry_dirty = true;
@@ -1882,10 +1892,12 @@ impl State {
         [x, y, w, self.status_bar_height()]
     }
 
-    /// File pane (left) — 30% of content width
+    /// File pane (left) — uses adjustable ratio of content width
     fn file_pane_rect(&self) -> [f32; 4] {
         let content = self.content_panel_rect();
-        let pane_w = (content[2] * 0.30).max(self.ui(180.0)).min(content[2] * 0.5);
+        let pane_w = (content[2] * self.file_pane_ratio)
+            .max(self.ui(120.0))
+            .min(content[2] * 0.70);
         [content[0], content[1], pane_w, content[3]]
     }
 
@@ -2882,11 +2894,36 @@ impl State {
         self.refresh_ui_scale();
     }
 
-    fn on_wheel(&mut self, delta: MouseScrollDelta) {
+    fn apply_zoom(&mut self, delta: f32) {
+        self.zoom_level = (self.zoom_level + delta).clamp(0.50, 2.50);
+        self.refresh_ui_scale();
+    }
+
+    fn adjust_pane_ratio(&mut self, delta: f32) {
+        self.file_pane_ratio = (self.file_pane_ratio + delta).clamp(0.10, 0.70);
+        self.layout_dirty = true;
+        self.geometry_dirty = true;
+    }
+
+    fn is_over_divider(&self, x: f32) -> bool {
+        let file_pane = self.file_pane_rect();
+        let divider_x = file_pane[0] + file_pane[2];
+        let grab_zone = self.ui(5.0);
+        (x - divider_x).abs() <= grab_zone
+    }
+
+    fn on_wheel(&mut self, delta: MouseScrollDelta, modifiers_ctrl: bool) {
         let dy = match delta {
             MouseScrollDelta::LineDelta(_, y) => -y * self.line_height * 3.0,
             MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
         };
+
+        // Ctrl+scroll = zoom
+        if modifiers_ctrl {
+            let zoom_delta = if dy < 0.0 { 0.10 } else { -0.10 };
+            self.apply_zoom(zoom_delta);
+            return;
+        }
 
         // Determine which pane the mouse is over
         let mx = self.mouse_pos.x as f32;
@@ -3031,6 +3068,27 @@ impl State {
                     "f" => self.handle_toolbar_action(ToolbarAction::Fetch),
                     "p" => self.handle_toolbar_action(ToolbarAction::Pull),
                     "x" => self.handle_toolbar_action(ToolbarAction::Discard),
+                    "=" | "+" => {
+                        self.apply_zoom(0.10);
+                        Ok(true)
+                    }
+                    "-" => {
+                        self.apply_zoom(-0.10);
+                        Ok(true)
+                    }
+                    "0" => {
+                        self.zoom_level = 1.0;
+                        self.refresh_ui_scale();
+                        Ok(true)
+                    }
+                    "[" => {
+                        self.adjust_pane_ratio(-0.05);
+                        Ok(true)
+                    }
+                    "]" => {
+                        self.adjust_pane_ratio(0.05);
+                        Ok(true)
+                    }
                     _ => Ok(false),
                 }
             }
@@ -3109,6 +3167,7 @@ impl State {
 pub struct App {
     state: Option<State>,
     git: Option<GitModel>,
+    modifiers: Modifiers,
 }
 
 impl App {
@@ -3116,6 +3175,7 @@ impl App {
         Self {
             state: None,
             git: Some(git),
+            modifiers: Modifiers::default(),
         }
     }
 }
@@ -3150,16 +3210,44 @@ impl ApplicationHandler for App {
                 st.refresh_ui_scale();
                 needs_redraw = true;
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods;
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 st.mouse_pos = position;
+
+                // Handle divider drag
+                if st.divider_dragging {
+                    let content = st.content_panel_rect();
+                    if content[2] > 0.0 {
+                        let ratio = (position.x as f32 - content[0]) / content[2];
+                        st.file_pane_ratio = ratio.clamp(0.10, 0.70);
+                        st.layout_dirty = true;
+                        st.geometry_dirty = true;
+                        needs_redraw = true;
+                    }
+                }
+
+                // Update cursor icon for divider hover
+                if st.is_over_divider(position.x as f32) || st.divider_dragging {
+                    st.window.set_cursor(CursorIcon::EwResize);
+                } else {
+                    st.window.set_cursor(CursorIcon::Default);
+                }
             }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
             } => {
+                if state == ElementState::Released {
+                    st.divider_dragging = false;
+                }
                 if state == ElementState::Pressed {
-                    if let Some(action) = st.window_control_action_at(st.mouse_pos) {
+                    // Check divider drag before other click handlers
+                    if st.is_over_divider(st.mouse_pos.x as f32) {
+                        st.divider_dragging = true;
+                    } else if let Some(action) = st.window_control_action_at(st.mouse_pos) {
                         match action {
                             WindowControlAction::Close => {
                                 event_loop.exit();
@@ -3209,7 +3297,8 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                st.on_wheel(delta);
+                let ctrl = self.modifiers.state().control_key();
+                st.on_wheel(delta, ctrl);
                 needs_redraw = true;
             }
             WindowEvent::KeyboardInput { event, .. } => {
