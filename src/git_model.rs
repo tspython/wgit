@@ -117,6 +117,10 @@ enum GitCommand<'a> {
         branch: Option<&'a str>,
         set_upstream: bool,
     },
+    ListBranches,
+    CheckoutBranch {
+        name: &'a str,
+    },
 }
 
 impl<'a> GitCommand<'a> {
@@ -211,6 +215,8 @@ impl<'a> GitCommand<'a> {
                 }
                 desc
             }
+            Self::ListBranches => String::from("git branch --list"),
+            Self::CheckoutBranch { name } => format!("git checkout {}", name),
         }
     }
 
@@ -315,6 +321,12 @@ impl<'a> GitCommand<'a> {
                 if let Some(branch) = branch {
                     command.arg(branch);
                 }
+            }
+            Self::ListBranches => {
+                command.args(["branch", "--list"]);
+            }
+            Self::CheckoutBranch { name } => {
+                command.args(["checkout", name]);
             }
         }
     }
@@ -433,6 +445,23 @@ impl GitModel {
             branch,
             set_upstream,
         })?;
+        self.refresh()
+    }
+
+    pub fn list_branches(&self) -> anyhow::Result<Vec<String>> {
+        let output = self.run_git(GitCommand::ListBranches)?;
+        let mut branches = Vec::new();
+        for line in output.lines() {
+            let name = line.trim().trim_start_matches("* ").to_string();
+            if !name.is_empty() {
+                branches.push(name);
+            }
+        }
+        Ok(branches)
+    }
+
+    pub fn checkout_branch(&mut self, name: &str) -> anyhow::Result<()> {
+        self.run_git(GitCommand::CheckoutBranch { name })?;
         self.refresh()
     }
 

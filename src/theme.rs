@@ -112,6 +112,10 @@ pub const MODAL_DANGER_BG_TOP: [f32; 4] = [0.20, 0.12, 0.12, 1.0];
 pub const MODAL_DANGER_BG_BOTTOM: [f32; 4] = [0.14, 0.08, 0.08, 1.0];
 pub const MODAL_DANGER_BORDER: [f32; 4] = [0.80, 0.35, 0.35, 0.60];
 
+// ── Branch switcher ─────────────────────────────────────────────
+/// Current branch indicator
+pub const BRANCH_CURRENT_BADGE: [f32; 4] = [0.40, 0.82, 0.52, 1.0];
+
 // ── Status bar per-kind ──────────────────────────────────────────
 pub const STATUS_NEUTRAL: ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) = (
     [0.12, 0.15, 0.22, 0.88],

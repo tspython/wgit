@@ -63,6 +63,7 @@ enum InputMode {
     CommitBody,
     RepoPicker,
     DiscardConfirm,
+    BranchSwitcher,
 }
 
 struct State {
@@ -115,6 +116,13 @@ struct State {
     repo_picker_index: usize,
     repo_picker_scroll: usize,
     pending_discard_path: Option<PathBuf>,
+
+    // ── Branch switcher ───────────────────────────────────────
+    branch_list: Vec<String>,
+    branch_current: String,
+    branch_picker_index: usize,
+    branch_picker_scroll: usize,
+
     mouse_pos: PhysicalPosition<f64>,
     window_controls: Vec<WindowControlButton>,
     toolbar_buttons: Vec<ToolbarButton>,
@@ -443,6 +451,10 @@ impl State {
             repo_picker_index: 0,
             repo_picker_scroll: 0,
             pending_discard_path: None,
+            branch_list: Vec::new(),
+            branch_current: String::new(),
+            branch_picker_index: 0,
+            branch_picker_scroll: 0,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             window_controls: Vec::new(),
             toolbar_buttons: Vec::new(),
@@ -634,6 +646,7 @@ impl State {
         self.commit_summary.clear();
         self.commit_body.clear();
         self.pending_discard_path = None;
+        self.branch_list.clear();
         self.set_selection_status();
     }
 
@@ -889,6 +902,141 @@ impl State {
         }
     }
 
+    // ── Folder browser (native OS dialog) ─────────────────────────
+
+    fn open_folder_dialog(&mut self) -> anyhow::Result<()> {
+        let start_dir = self.git.repo_root().parent()
+            .unwrap_or_else(|| std::path::Path::new("/"))
+            .to_path_buf();
+
+        let picked = rfd::FileDialog::new()
+            .set_title("Open Git Repository")
+            .set_directory(&start_dir)
+            .pick_folder();
+
+        let Some(path) = picked else {
+            return Ok(()); // user cancelled
+        };
+
+        let git = GitModel::open_at(&path)
+            .with_context(|| format!("{} is not a git repository", path.display()))?;
+        self.git = git;
+        let _ = repo_store::remember_repo(self.git.repo_root());
+        self.refresh_recent_repos();
+        self.refresh_document_from_git()?;
+        self.set_status(
+            StatusKind::Success,
+            format!("Opened repository {}", self.git.repo_root().display()),
+        );
+        Ok(())
+    }
+
+    // ── Branch switcher ─────────────────────────────────────────────
+
+    fn prompt_branch_switcher(&mut self) {
+        match self.git.list_branches() {
+            Ok(branches) => {
+                self.branch_current = self.git.branch().to_string();
+                self.branch_picker_index = branches
+                    .iter()
+                    .position(|b| b == &self.branch_current)
+                    .unwrap_or(0);
+                self.branch_list = branches;
+                self.branch_picker_scroll = 0;
+                self.set_branch_picker_index(self.branch_picker_index);
+                self.input_mode = InputMode::BranchSwitcher;
+                self.update_branch_picker_prompt();
+            }
+            Err(err) => {
+                self.set_status(StatusKind::Error, format!("Failed to list branches: {err}"));
+            }
+        }
+    }
+
+    fn update_branch_picker_prompt(&mut self) {
+        let message = if let Some(name) = self.branch_list.get(self.branch_picker_index) {
+            format!(
+                "Branch: {}  [Enter] checkout  [Esc] cancel",
+                compact_status_message(name, 48)
+            )
+        } else {
+            String::from("Branch switcher: use arrows, Enter to checkout, Esc to cancel")
+        };
+        self.set_status(StatusKind::Prompt, message);
+    }
+
+    fn set_branch_picker_index(&mut self, index: usize) {
+        if self.branch_list.is_empty() {
+            self.branch_picker_index = 0;
+            self.branch_picker_scroll = 0;
+            return;
+        }
+        let last = self.branch_list.len() - 1;
+        self.branch_picker_index = index.min(last);
+        let visible = 6usize;
+        if self.branch_picker_index < self.branch_picker_scroll {
+            self.branch_picker_scroll = self.branch_picker_index;
+        } else if self.branch_picker_index >= self.branch_picker_scroll + visible {
+            self.branch_picker_scroll = self.branch_picker_index + 1 - visible;
+        }
+    }
+
+    fn checkout_selected_branch(&mut self) -> anyhow::Result<()> {
+        let Some(name) = self.branch_list.get(self.branch_picker_index).cloned() else {
+            anyhow::bail!("no branch selected");
+        };
+        if name == self.branch_current {
+            self.cancel_input_mode();
+            return Ok(());
+        }
+        self.git.checkout_branch(&name)?;
+        self.refresh_document_from_git()?;
+        self.input_mode = InputMode::Normal;
+        self.branch_list.clear();
+        self.set_status(StatusKind::Success, format!("Switched to branch {name}"));
+        Ok(())
+    }
+
+    fn handle_branch_switcher_input(&mut self, key: &Key) -> anyhow::Result<bool> {
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.cancel_input_mode();
+                Ok(true)
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.checkout_selected_branch()?;
+                Ok(true)
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if self.branch_picker_index > 0 {
+                    self.set_branch_picker_index(self.branch_picker_index - 1);
+                    self.update_branch_picker_prompt();
+                }
+                Ok(true)
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if self.branch_picker_index + 1 < self.branch_list.len() {
+                    self.set_branch_picker_index(self.branch_picker_index + 1);
+                    self.update_branch_picker_prompt();
+                }
+                Ok(true)
+            }
+            Key::Named(NamedKey::Home) => {
+                self.set_branch_picker_index(0);
+                self.update_branch_picker_prompt();
+                Ok(true)
+            }
+            Key::Named(NamedKey::End) => {
+                if !self.branch_list.is_empty() {
+                    self.set_branch_picker_index(self.branch_list.len() - 1);
+                    self.update_branch_picker_prompt();
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn execute_action<F>(&mut self, label: &str, action: F) -> bool
     where
         F: FnOnce(&mut Self) -> anyhow::Result<()>,
@@ -910,6 +1058,14 @@ impl State {
             ToolbarAction::Quit => Ok(false),
             ToolbarAction::RepoSwitch => {
                 self.prompt_repo_picker();
+                Ok(true)
+            }
+            ToolbarAction::Browse => {
+                self.open_folder_dialog()?;
+                Ok(true)
+            }
+            ToolbarAction::BranchSwitch => {
+                self.prompt_branch_switcher();
                 Ok(true)
             }
             ToolbarAction::Commit => {
@@ -1069,6 +1225,9 @@ impl State {
             }
             InputMode::DiscardConfirm => {
                 self.build_discard_overlay_geometry(text_vertices, rect_instances)
+            }
+            InputMode::BranchSwitcher => {
+                self.build_branch_switcher_overlay_geometry(text_vertices, rect_instances)
             }
             InputMode::Normal => Ok(()),
         }
@@ -1360,6 +1519,115 @@ impl State {
             hint_y + self.ascent,
             "Enter / y confirm  Esc cancel",
             [1.0, 0.84, 0.84, 1.0],
+        )?;
+
+        Ok(())
+    }
+
+    fn build_branch_switcher_overlay_geometry(
+        &mut self,
+        text_vertices: &mut Vec<TextVertex>,
+        rect_instances: &mut Vec<StyledRectInstance>,
+    ) -> anyhow::Result<()> {
+        let visible_start = self.branch_picker_scroll.min(self.branch_list.len());
+        let visible_end = (visible_start + 6).min(self.branch_list.len());
+        let visible_count = visible_end.saturating_sub(visible_start);
+        let panel_h = self.ui(92.0) + visible_count as f32 * (self.line_height + self.ui(6.0));
+        let panel = self.modal_panel_rect(panel_h);
+        push_styled_rect(
+            rect_instances,
+            panel,
+            theme::MODAL_BG_TOP,
+            theme::MODAL_BG_BOTTOM,
+            theme::MODAL_BORDER,
+            [0.0, 0.0, 0.0, 0.28],
+            self.ui(12.0),
+            1.0,
+            1.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
+        );
+
+        let mut x = panel[0] + self.ui(16.0);
+        let mut y = panel[1] + self.ui(18.0);
+        self.append_text_run(
+            text_vertices,
+            &mut x,
+            y + self.ascent,
+            "Switch branch",
+            [0.92, 0.96, 1.0, 1.0],
+        )?;
+
+        y += self.line_height * 1.4;
+        let row_x = panel[0] + self.ui(14.0);
+        let row_w = panel[2] - self.ui(28.0);
+        let visible_branches: Vec<String> = self.branch_list[visible_start..visible_end].to_vec();
+        for (offset, branch) in visible_branches.iter().enumerate() {
+            let idx = visible_start + offset;
+            let row_y = y + offset as f32 * (self.line_height + self.ui(6.0));
+            let selected = idx == self.branch_picker_index;
+            let is_current = branch == &self.branch_current;
+            let (fill_top, fill_bottom, stroke) = if selected {
+                (
+                    [0.25, 0.33, 0.50, 1.0],
+                    [0.18, 0.24, 0.38, 1.0],
+                    [0.52, 0.68, 0.98, 0.70],
+                )
+            } else {
+                (
+                    [0.16, 0.18, 0.26, 1.0],
+                    [0.12, 0.14, 0.20, 1.0],
+                    [0.30, 0.36, 0.48, 0.40],
+                )
+            };
+            push_styled_rect(
+                rect_instances,
+                [row_x, row_y, row_w, self.line_height + self.ui(4.0)],
+                fill_top,
+                fill_bottom,
+                stroke,
+                [0.0, 0.0, 0.0, 0.0],
+                self.ui(8.0),
+                1.0,
+                1.0,
+                0.0,
+                [0.0, 0.0],
+                0.0,
+            );
+
+            let mut tx = row_x + self.ui(10.0);
+            let mut label = branch.clone();
+            if is_current {
+                label.push_str("  (current)");
+            }
+            let text_color = if is_current && !selected {
+                theme::BRANCH_CURRENT_BADGE
+            } else if selected {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.86, 0.90, 0.96, 1.0]
+            };
+            self.append_text_run(
+                text_vertices,
+                &mut tx,
+                row_y + self.ascent + 2.0,
+                &compact_status_message(
+                    &label,
+                    ((row_w - self.ui(20.0)) / self.cell_width).max(1.0) as usize,
+                ),
+                text_color,
+            )?;
+        }
+
+        let mut hint_x = panel[0] + self.ui(16.0);
+        let hint_y = panel[1] + panel[3] - self.line_height + self.ui(4.0);
+        self.append_text_run(
+            text_vertices,
+            &mut hint_x,
+            hint_y + self.ascent,
+            "Enter checkout  Esc cancel  Up/Down move",
+            [0.76, 0.82, 0.92, 1.0],
         )?;
 
         Ok(())
@@ -1978,6 +2246,18 @@ impl State {
             ButtonConfig {
                 label: String::from("o repos"),
                 action: ToolbarAction::RepoSwitch,
+                group: ToolbarGroup::App,
+                style: gray_btn,
+            },
+            ButtonConfig {
+                label: String::from("b browse"),
+                action: ToolbarAction::Browse,
+                group: ToolbarGroup::App,
+                style: gray_btn,
+            },
+            ButtonConfig {
+                label: String::from("B branch"),
+                action: ToolbarAction::BranchSwitch,
                 group: ToolbarGroup::App,
                 style: gray_btn,
             },
@@ -2707,6 +2987,9 @@ impl State {
                 if raw == "X" {
                     return self.handle_toolbar_action(ToolbarAction::Discard);
                 }
+                if raw == "B" {
+                    return self.handle_toolbar_action(ToolbarAction::BranchSwitch);
+                }
 
                 let c = raw.to_ascii_lowercase();
                 match c.as_str() {
@@ -2721,6 +3004,7 @@ impl State {
                         Ok(true)
                     }
                     "o" => self.handle_toolbar_action(ToolbarAction::RepoSwitch),
+                    "b" => self.handle_toolbar_action(ToolbarAction::Browse),
                     "j" => match self.focus_pane {
                         FocusPane::Files => self.move_selection_and_refresh(1),
                         FocusPane::Diff => {
@@ -2941,6 +3225,9 @@ impl ApplicationHandler for App {
                             InputMode::DiscardConfirm => {
                                 st.handle_discard_confirm_input(&event.logical_key)
                             }
+                            InputMode::BranchSwitcher => {
+                                st.handle_branch_switcher_input(&event.logical_key)
+                            }
                             InputMode::Normal => Ok(false),
                         }
                     } else {
@@ -2973,6 +3260,7 @@ impl ApplicationHandler for App {
                                 }
                                 InputMode::RepoPicker => "Repo switch failed",
                                 InputMode::DiscardConfirm => "Discard failed",
+                                InputMode::BranchSwitcher => "Branch switch failed",
                                 InputMode::Normal => "Input handling failed",
                             };
                             st.set_status(StatusKind::Error, format!("{label}: {err}"));

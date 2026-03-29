@@ -100,6 +100,8 @@ impl LineStyle {
 #[derive(Clone, Copy, Debug)]
 pub enum ToolbarAction {
     RepoSwitch,
+    Browse,
+    BranchSwitch,
     Commit,
     Fetch,
     Pull,
