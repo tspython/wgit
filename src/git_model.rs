@@ -103,6 +103,7 @@ enum GitCommand<'a> {
     Commit {
         message: &'a str,
         allow_empty: bool,
+        amend: bool,
     },
     Fetch {
         remote: Option<&'a str>,
@@ -166,10 +167,14 @@ impl<'a> GitCommand<'a> {
             Self::Commit {
                 message,
                 allow_empty,
+                amend,
             } => {
                 let mut desc = format!("git commit --message {}", compact_preview(message, 48));
                 if allow_empty {
                     desc.push_str(" --allow-empty");
+                }
+                if amend {
+                    desc.push_str(" --amend");
                 }
                 desc
             }
@@ -277,10 +282,14 @@ impl<'a> GitCommand<'a> {
             Self::Commit {
                 message,
                 allow_empty,
+                amend,
             } => {
                 command.arg("commit");
                 if allow_empty {
                     command.arg("--allow-empty");
+                }
+                if amend {
+                    command.arg("--amend");
                 }
                 command.args(["--message", message]);
             }
@@ -390,6 +399,15 @@ impl GitModel {
     }
 
     pub fn commit(&mut self, message: &str) -> anyhow::Result<()> {
+        self.commit_with_options(message, false, false)
+    }
+
+    pub fn commit_with_options(
+        &mut self,
+        message: &str,
+        allow_empty: bool,
+        amend: bool,
+    ) -> anyhow::Result<()> {
         let message = message.trim();
         if message.is_empty() {
             anyhow::bail!("commit message cannot be empty");
@@ -397,7 +415,8 @@ impl GitModel {
 
         self.run_git(GitCommand::Commit {
             message,
-            allow_empty: false,
+            allow_empty,
+            amend,
         })?;
         self.refresh()
     }
@@ -1462,5 +1481,17 @@ not a status line
                 },
             ]
         );
+    }
+
+    #[test]
+    fn commit_command_description_includes_amend_when_requested() {
+        let desc = GitCommand::Commit {
+            message: "chore: update",
+            allow_empty: false,
+            amend: true,
+        }
+        .description();
+        assert!(desc.contains("git commit --message"));
+        assert!(desc.contains("--amend"));
     }
 }

@@ -111,6 +111,7 @@ struct State {
     input_mode: InputMode,
     commit_summary: String,
     commit_body: String,
+    commit_amend: bool,
     repo_tracking: BranchTrackingStatus,
     recent_repos: Vec<PathBuf>,
     repo_picker_index: usize,
@@ -453,6 +454,7 @@ impl State {
             input_mode: InputMode::Normal,
             commit_summary: String::new(),
             commit_body: String::new(),
+            commit_amend: false,
             repo_tracking: BranchTrackingStatus::default(),
             recent_repos: Vec::new(),
             repo_picker_index: 0,
@@ -625,9 +627,10 @@ impl State {
         self.input_mode = InputMode::CommitSummary;
         self.commit_summary.clear();
         self.commit_body.clear();
+        self.commit_amend = false;
         self.set_status(
             StatusKind::Prompt,
-            "Commit summary: type a subject, Enter for body, Esc to cancel",
+            "Commit summary: type a subject, Enter for body, Ctrl+A toggle amend, Esc to cancel",
         );
     }
 
@@ -655,6 +658,7 @@ impl State {
         self.input_mode = InputMode::Normal;
         self.commit_summary.clear();
         self.commit_body.clear();
+        self.commit_amend = false;
         self.pending_discard_path = None;
         self.branch_list.clear();
         self.set_selection_status();
@@ -664,23 +668,28 @@ impl State {
         let message = match self.input_mode {
             InputMode::CommitSummary => {
                 if self.commit_summary.is_empty() {
-                    String::from("Commit summary: type a subject, Enter for body, Esc to cancel")
+                    format!(
+                        "Commit summary: type a subject, Enter for body, Ctrl+A amend({}), Esc cancel",
+                        if self.commit_amend { "on" } else { "off" }
+                    )
                 } else {
                     format!(
-                        "Commit summary: {}  [Enter] next  [Esc] cancel",
-                        self.commit_summary
+                        "Commit summary: {}  [Enter] next  [Ctrl+A] amend({})  [Esc] cancel",
+                        self.commit_summary,
+                        if self.commit_amend { "on" } else { "off" }
                     )
                 }
             }
             InputMode::CommitBody => {
                 if self.commit_body.is_empty() {
                     String::from(
-                        "Commit body: optional details, Enter to submit, Tab back, Esc cancel",
+                        "Commit body: optional details, Enter submit, Tab back, Ctrl+A amend, Esc cancel",
                     )
                 } else {
                     format!(
-                        "Commit body: {}  [Enter] submit  [Tab] back  [Esc] cancel",
-                        self.commit_body
+                        "Commit body: {}  [Enter] submit  [Tab] back  [Ctrl+A] amend({})  [Esc] cancel",
+                        self.commit_body,
+                        if self.commit_amend { "on" } else { "off" }
                     )
                 }
             }
@@ -715,14 +724,19 @@ impl State {
             format!("{summary}\n\n{body}")
         };
 
-        self.git.commit(&message)?;
+        let amend = self.commit_amend;
+        self.git.commit_with_options(&message, false, amend)?;
         self.refresh_document_from_git()?;
         self.input_mode = InputMode::Normal;
         self.commit_summary.clear();
         self.commit_body.clear();
+        self.commit_amend = false;
         self.set_status(
             StatusKind::Success,
-            format!("Committed changes: {summary_for_status}"),
+            format!(
+                "Committed{}: {summary_for_status}",
+                if amend { " (amend)" } else { "" }
+            ),
         );
         Ok(())
     }
@@ -799,7 +813,7 @@ impl State {
         text.get(5..).map(|path| PathBuf::from(path.trim()))
     }
 
-    fn handle_commit_input(&mut self, key: &Key) -> anyhow::Result<bool> {
+    fn handle_commit_input(&mut self, key: &Key, ctrl: bool) -> anyhow::Result<bool> {
         match key {
             Key::Named(NamedKey::Escape) => {
                 self.cancel_input_mode();
@@ -829,6 +843,11 @@ impl State {
                 Ok(true)
             }
             Key::Character(ch) => {
+                if ctrl && ch.eq_ignore_ascii_case("a") {
+                    self.commit_amend = !self.commit_amend;
+                    self.update_commit_prompt();
+                    return Ok(true);
+                }
                 let mut changed = false;
                 for c in ch.chars() {
                     if !c.is_control() {
@@ -1273,6 +1292,18 @@ impl State {
             "Commit message",
             [0.92, 0.96, 1.0, 1.0],
         )?;
+        let mut amend_x = panel[0] + panel[2] - self.ui(180.0);
+        self.append_text_run(
+            text_vertices,
+            &mut amend_x,
+            y + self.ascent,
+            &format!("Amend: {}", if self.commit_amend { "ON" } else { "OFF" }),
+            if self.commit_amend {
+                [0.66, 0.95, 0.73, 1.0]
+            } else {
+                [0.73, 0.79, 0.90, 1.0]
+            },
+        )?;
 
         y += self.line_height * 1.2;
         let summary_active = matches!(self.input_mode, InputMode::CommitSummary);
@@ -1363,7 +1394,7 @@ impl State {
             text_vertices,
             &mut hint_x,
             hint_y + self.ascent,
-            "Enter next / submit  Tab switch  Esc cancel",
+            "Enter next / submit  Tab switch  Ctrl+A amend  Esc cancel",
             [0.76, 0.82, 0.92, 1.0],
         )?;
 
@@ -3304,9 +3335,10 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     let handled = if st.input_mode != InputMode::Normal {
+                        let ctrl = self.modifiers.state().control_key();
                         match st.input_mode {
                             InputMode::CommitSummary | InputMode::CommitBody => {
-                                st.handle_commit_input(&event.logical_key)
+                                st.handle_commit_input(&event.logical_key, ctrl)
                             }
                             InputMode::RepoPicker => {
                                 st.handle_repo_picker_input(&event.logical_key)
