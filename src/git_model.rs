@@ -780,18 +780,18 @@ impl GitModel {
 
     /// Build diff lines from difftastic inline output.
     ///
-    /// Difftastic inline output (with `DFT_COLOR=never`) uses a simple format:
-    /// - File path headers (contain the filename)
-    /// - Section headers starting with a line number
-    /// - Lines are shown with context; changed regions are not prefixed with +/-
-    /// - Empty lines separate sections
+    /// Difftastic inline output uses ANSI color codes to indicate changes:
+    /// - Red/bold-red line numbers → removed lines
+    /// - Green/bold-green line numbers → added lines
+    /// - No color on line numbers → context lines
+    /// - File path headers and blank lines separate hunks
     ///
-    /// Since difftastic provides its own structural diff rendering, we display
-    /// the output largely as-is, applying lightweight styling.
+    /// We parse ANSI codes to classify lines, then strip them for display.
     fn build_diff_document_difft(&self, lines: &mut Vec<DocLine>) {
         for raw_line in self.diff.lines() {
-            let text = normalize_for_display(raw_line);
             let style = style_for_difft_line(raw_line);
+            let stripped = strip_ansi_codes(raw_line);
+            let text = normalize_for_display(&stripped);
             lines.push(DocLine::new(text, style));
         }
     }
@@ -807,11 +807,12 @@ impl GitModel {
     }
 
     /// Run `git diff` with `GIT_EXTERNAL_DIFF=difft` to get difftastic output.
+    /// We keep ANSI colors enabled so we can parse them to determine line types.
     fn difft_diff_for_path(&self, path: &str, cached: bool) -> anyhow::Result<String> {
         let mut git = Command::new("git");
         git.arg("-C").arg(&self.repo_root);
         git.env("GIT_EXTERNAL_DIFF", "difft");
-        git.env("DFT_COLOR", "never");
+        git.env("DFT_COLOR", "always");
         git.env("DFT_DISPLAY", "inline");
         git.arg("diff");
         if cached {
@@ -1365,28 +1366,83 @@ fn style_for_diff_line(line: &str) -> LineStyle {
 }
 
 /// Classify a line of difftastic inline output for styling.
+///
+/// Difftastic uses ANSI color codes to distinguish line types:
+/// - Red (ESC[31m / ESC[1;31m) on line numbers → removed line
+/// - Green (ESC[32m / ESC[1;32m) on line numbers → added line
+/// - Bold (ESC[1m) without red/green → hunk/file header
+/// - No ANSI codes → context or metadata
 fn style_for_difft_line(line: &str) -> LineStyle {
-    if line.starts_with("# ") {
-        // Section header (e.g. "# Unstaged", "# Staged")
-        LineStyle::DiffMeta
-    } else if line.is_empty() {
-        LineStyle::Normal
+    let stripped = strip_ansi_codes(line);
+    if stripped.starts_with("# ") {
+        return LineStyle::DiffMeta;
+    }
+    if stripped.trim().is_empty() {
+        return LineStyle::Normal;
+    }
+
+    // Difftastic uses ANSI codes on line numbers to indicate line type.
+    // We check the *start* of the line (before the content) for the line-number color.
+    // Red/bright-red line number = removed, green/bright-green = added.
+    //
+    // The line number is the first non-space token. Removed lines start at column 0,
+    // added lines are indented with spaces (right-side in inline mode).
+    let has_red = line.contains("\x1b[31m")
+        || line.contains("\x1b[1;31m")
+        || line.contains("\x1b[91m")
+        || line.contains("\x1b[91;1m")
+        || line.contains("\x1b[1;91m");
+    let has_green = line.contains("\x1b[32m")
+        || line.contains("\x1b[1;32m")
+        || line.contains("\x1b[92m")
+        || line.contains("\x1b[92;1m")
+        || line.contains("\x1b[1;92m");
+
+    if has_red && !has_green {
+        LineStyle::DiffRemove
+    } else if has_green && !has_red {
+        LineStyle::DiffAdd
+    } else if has_red && has_green {
+        // Both colors present on same line — difftastic shows inline word changes.
+        // Treat as a modification (use DiffAdd since it shows the new state).
+        LineStyle::DiffAdd
+    } else if line.contains("\x1b[1m") || line.contains("\x1b[93m") {
+        // Bold or bright-yellow = file/hunk header
+        LineStyle::DiffHunk
     } else {
-        // Difftastic inline output doesn't use +/- prefixes.
-        // It shows the file path as the first non-empty line, and then
-        // sections of code. We do a best-effort classification.
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            LineStyle::Normal
-        } else if trimmed.starts_with("---") || trimmed.starts_with("+++") {
-            LineStyle::DiffMeta
+        LineStyle::Normal
+    }
+}
+
+/// Strip ANSI escape sequences from a string, returning plain text.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip ESC [ ... <final byte>
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // Consume parameter bytes (0x30–0x3F) and intermediate bytes (0x20–0x2F),
+                // then the final byte (0x40–0x7E).
+                loop {
+                    match chars.peek() {
+                        Some(&c) if (0x40..=0x7E).contains(&(c as u32)) => {
+                            chars.next(); // consume final byte
+                            break;
+                        }
+                        Some(_) => {
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+            }
         } else {
-            // Difftastic inline mode shows a line number, then the content.
-            // Changed regions are typically marked by the tool's own display.
-            // Since we're using --color never, we just render as normal text.
-            LineStyle::Normal
+            out.push(ch);
         }
     }
+    out
 }
 
 /// Parse `@@ -old,count +new,count @@` → (old_start, new_start)
@@ -1601,5 +1657,71 @@ not a status line
                 },
             ]
         );
+    }
+
+    #[test]
+    fn strips_ansi_escape_sequences() {
+        assert_eq!(strip_ansi_codes("hello"), "hello");
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi_codes("\x1b[1;32mbold green\x1b[0m"), "bold green");
+        assert_eq!(
+            strip_ansi_codes("\x1b[31m42\x1b[0m   old code"),
+            "42   old code"
+        );
+        assert_eq!(strip_ansi_codes("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn classifies_difft_lines_by_ansi_color() {
+        // Red line number = removed
+        assert!(matches!(
+            style_for_difft_line("\x1b[31m42\x1b[0m   fn old_code()"),
+            LineStyle::DiffRemove
+        ));
+        // Green line number = added
+        assert!(matches!(
+            style_for_difft_line("\x1b[32m42\x1b[0m   fn new_code()"),
+            LineStyle::DiffAdd
+        ));
+        // Bold red = removed
+        assert!(matches!(
+            style_for_difft_line("\x1b[1;31m10\x1b[0m   removed"),
+            LineStyle::DiffRemove
+        ));
+        // Bold green = added
+        assert!(matches!(
+            style_for_difft_line("\x1b[1;32m10\x1b[0m   added"),
+            LineStyle::DiffAdd
+        ));
+        // Bright red (91) = removed (actual difft output)
+        assert!(matches!(
+            style_for_difft_line("\x1b[91;1m783 \x1b[0m   old code"),
+            LineStyle::DiffRemove
+        ));
+        // Bright green (92) = added (actual difft output)
+        assert!(matches!(
+            style_for_difft_line("   \x1b[92;1m783 \x1b[0m   new code"),
+            LineStyle::DiffAdd
+        ));
+        // Dim (context) = normal
+        assert!(matches!(
+            style_for_difft_line("\x1b[2m780 \x1b[0m   context line"),
+            LineStyle::Normal
+        ));
+        // No color = context
+        assert!(matches!(
+            style_for_difft_line("42   context line"),
+            LineStyle::Normal
+        ));
+        // Section header
+        assert!(matches!(
+            style_for_difft_line("# Unstaged"),
+            LineStyle::DiffMeta
+        ));
+        // Bold bright-yellow = file/hunk header (actual difft output)
+        assert!(matches!(
+            style_for_difft_line("\x1b[1m\x1b[93msrc/main.rs\x1b[39m\x1b[0m --- 1/2 --- Rust"),
+            LineStyle::DiffHunk
+        ));
     }
 }
