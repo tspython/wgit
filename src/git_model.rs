@@ -5,6 +5,32 @@ use tree_sitter::{Language, Node, Parser};
 
 use crate::models::{ColorSpan, DiffLineNumber, DocLine, Document, GitViewMeta, LineStyle};
 
+/// Which tool to use for generating diff output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffBackend {
+    #[default]
+    GitDiff,
+    Difftastic,
+}
+
+impl DiffBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GitDiff => "git diff",
+            Self::Difftastic => "difftastic",
+        }
+    }
+}
+
+/// Check whether the `difft` binary is available on PATH.
+fn difft_available() -> bool {
+    Command::new("difft")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GitEntry {
     xy: String,
@@ -340,6 +366,8 @@ pub struct GitModel {
     selected: usize,
     diff: String,
     ts_parser: Parser,
+    diff_backend: DiffBackend,
+    has_difft: bool,
 }
 
 impl GitModel {
@@ -355,6 +383,7 @@ impl GitModel {
             .unwrap_or_else(|| repo.git_dir())
             .to_path_buf();
 
+        let has_difft = difft_available();
         let mut s = Self {
             repo_root,
             branch: String::new(),
@@ -363,6 +392,8 @@ impl GitModel {
             selected: 0,
             diff: String::new(),
             ts_parser: Parser::new(),
+            diff_backend: DiffBackend::default(),
+            has_difft,
         };
 
         s.refresh()?;
@@ -387,6 +418,34 @@ impl GitModel {
 
     pub fn tracking(&self) -> &BranchTrackingStatus {
         &self.tracking
+    }
+
+    pub fn diff_backend(&self) -> DiffBackend {
+        self.diff_backend
+    }
+
+    pub fn has_difft(&self) -> bool {
+        self.has_difft
+    }
+
+    /// Toggle between git-diff and difftastic backends.
+    /// Returns the newly active backend, or an error if difft is not installed.
+    pub fn toggle_diff_backend(&mut self) -> anyhow::Result<DiffBackend> {
+        match self.diff_backend {
+            DiffBackend::GitDiff => {
+                if !self.has_difft {
+                    anyhow::bail!(
+                        "difft not found on PATH. Install: cargo install difftastic"
+                    );
+                }
+                self.diff_backend = DiffBackend::Difftastic;
+            }
+            DiffBackend::Difftastic => {
+                self.diff_backend = DiffBackend::GitDiff;
+            }
+        }
+        self.refresh_diff()?;
+        Ok(self.diff_backend)
     }
 
     pub fn commit(&mut self, message: &str) -> anyhow::Result<()> {
@@ -639,21 +698,32 @@ impl GitModel {
     fn build_diff_document(&mut self) -> anyhow::Result<Document> {
         let mut lines: Vec<DocLine> = Vec::new();
 
-        // Diff file header
+        let backend_label = match self.diff_backend {
+            DiffBackend::GitDiff => "",
+            DiffBackend::Difftastic => " [difftastic]",
+        };
         let diff_title = self
             .entries
             .get(self.selected)
-            .map(|e| format!(" {}", e.path))
+            .map(|e| format!(" {}{}", e.path, backend_label))
             .unwrap_or_else(|| String::from(" No file selected"));
         lines.push(DocLine::new(diff_title, LineStyle::DiffFileHeader));
 
-        // Parse diff lines with line numbers
+        match self.diff_backend {
+            DiffBackend::GitDiff => self.build_diff_document_git(&mut lines)?,
+            DiffBackend::Difftastic => self.build_diff_document_difft(&mut lines),
+        }
+
+        Ok(Document::from_lines(lines))
+    }
+
+    /// Build diff lines from standard unified git-diff output.
+    fn build_diff_document_git(&mut self, lines: &mut Vec<DocLine>) -> anyhow::Result<()> {
         let raw_lines: Vec<String> = self.diff.lines().map(|l| l.to_string()).collect();
         let diff_texts: Vec<String> = raw_lines.iter().map(|l| normalize_for_display(l)).collect();
         let diff_styles: Vec<LineStyle> = raw_lines.iter().map(|l| style_for_diff_line(l)).collect();
         let diff_spans = self.syntax_spans_for_diff_lines(&diff_texts, &diff_styles)?;
 
-        // Track line numbers through hunk headers
         let mut old_line: u32 = 0;
         let mut new_line: u32 = 0;
 
@@ -666,7 +736,6 @@ impl GitModel {
             let raw = &raw_lines[i];
             let ln = match style {
                 LineStyle::DiffHunk => {
-                    // Parse @@ -old,count +new,count @@ ...
                     if let Some((o, n)) = parse_hunk_header(raw) {
                         old_line = o;
                         new_line = n;
@@ -690,7 +759,6 @@ impl GitModel {
                     Some(ln)
                 }
                 LineStyle::Normal => {
-                    // Context line — has both line numbers
                     let ln = DiffLineNumber {
                         old: Some(old_line),
                         new: Some(new_line),
@@ -699,7 +767,7 @@ impl GitModel {
                     new_line += 1;
                     Some(ln)
                 }
-                _ => None, // metadata lines
+                _ => None,
             };
 
             let mut doc_line = DocLine::new(text, style).with_spans(spans);
@@ -707,7 +775,25 @@ impl GitModel {
             lines.push(doc_line);
         }
 
-        Ok(Document::from_lines(lines))
+        Ok(())
+    }
+
+    /// Build diff lines from difftastic inline output.
+    ///
+    /// Difftastic inline output (with `DFT_COLOR=never`) uses a simple format:
+    /// - File path headers (contain the filename)
+    /// - Section headers starting with a line number
+    /// - Lines are shown with context; changed regions are not prefixed with +/-
+    /// - Empty lines separate sections
+    ///
+    /// Since difftastic provides its own structural diff rendering, we display
+    /// the output largely as-is, applying lightweight styling.
+    fn build_diff_document_difft(&self, lines: &mut Vec<DocLine>) {
+        for raw_line in self.diff.lines() {
+            let text = normalize_for_display(raw_line);
+            let style = style_for_difft_line(raw_line);
+            lines.push(DocLine::new(text, style));
+        }
     }
 
     /// Legacy: build a single combined document (kept for backwards compatibility).
@@ -718,6 +804,24 @@ impl GitModel {
 
     fn diff_for_path(&self, path: &str, cached: bool) -> anyhow::Result<String> {
         self.run_git(GitCommand::Diff { path, cached })
+    }
+
+    /// Run `git diff` with `GIT_EXTERNAL_DIFF=difft` to get difftastic output.
+    fn difft_diff_for_path(&self, path: &str, cached: bool) -> anyhow::Result<String> {
+        let mut git = Command::new("git");
+        git.arg("-C").arg(&self.repo_root);
+        git.env("GIT_EXTERNAL_DIFF", "difft");
+        git.env("DFT_COLOR", "never");
+        git.env("DFT_DISPLAY", "inline");
+        git.arg("diff");
+        if cached {
+            git.arg("--cached");
+        }
+        git.args(["--", path]);
+
+        let out = git.output().context("failed to spawn difft via git")?;
+        // difft may exit with code 1 when there are differences — that's normal.
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
     pub fn refresh(&mut self) -> anyhow::Result<()> {
@@ -740,8 +844,18 @@ impl GitModel {
             return Ok(());
         };
 
-        let unstaged = self.diff_for_path(&path, false)?;
-        let staged = self.diff_for_path(&path, true)?;
+        let (unstaged, staged) = match self.diff_backend {
+            DiffBackend::GitDiff => {
+                let u = self.diff_for_path(&path, false)?;
+                let s = self.diff_for_path(&path, true)?;
+                (u, s)
+            }
+            DiffBackend::Difftastic => {
+                let u = self.difft_diff_for_path(&path, false)?;
+                let s = self.difft_diff_for_path(&path, true)?;
+                (u, s)
+            }
+        };
 
         let mut out = String::new();
         if !unstaged.trim().is_empty() {
@@ -1247,6 +1361,31 @@ fn style_for_diff_line(line: &str) -> LineStyle {
         LineStyle::DiffMeta
     } else {
         LineStyle::Normal
+    }
+}
+
+/// Classify a line of difftastic inline output for styling.
+fn style_for_difft_line(line: &str) -> LineStyle {
+    if line.starts_with("# ") {
+        // Section header (e.g. "# Unstaged", "# Staged")
+        LineStyle::DiffMeta
+    } else if line.is_empty() {
+        LineStyle::Normal
+    } else {
+        // Difftastic inline output doesn't use +/- prefixes.
+        // It shows the file path as the first non-empty line, and then
+        // sections of code. We do a best-effort classification.
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            LineStyle::Normal
+        } else if trimmed.starts_with("---") || trimmed.starts_with("+++") {
+            LineStyle::DiffMeta
+        } else {
+            // Difftastic inline mode shows a line number, then the content.
+            // Changed regions are typically marked by the tool's own display.
+            // Since we're using --color never, we just render as normal text.
+            LineStyle::Normal
+        }
     }
 }
 

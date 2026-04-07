@@ -3060,6 +3060,17 @@ impl State {
                             Ok(true)
                         }
                     },
+                    "d" => {
+                        Ok(self.execute_action("Diff backend toggled", |state| {
+                            let backend = state.git.toggle_diff_backend()?;
+                            state.refresh_document_from_git()?;
+                            state.set_status(
+                                StatusKind::Success,
+                                format!("Diff backend: {}", backend.label()),
+                            );
+                            Ok(())
+                        }))
+                    }
                     "r" => self.handle_toolbar_action(ToolbarAction::Refresh),
                     "s" => self.handle_toolbar_action(ToolbarAction::Stage),
                     "u" => self.handle_toolbar_action(ToolbarAction::Unstage),
