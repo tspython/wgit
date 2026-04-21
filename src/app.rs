@@ -64,6 +64,7 @@ enum InputMode {
     RepoPicker,
     DiscardConfirm,
     BranchSwitcher,
+    Settings,
 }
 
 struct State {
@@ -126,6 +127,9 @@ struct State {
     mouse_pos: PhysicalPosition<f64>,
     window_controls: Vec<WindowControlButton>,
     toolbar_buttons: Vec<ToolbarButton>,
+
+    // ── Settings modal ───────────────────────────────────
+    settings_index: usize,
 
     // ── Panel split ratio ────────────────────────────────
     file_pane_ratio: f32,
@@ -465,6 +469,7 @@ impl State {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             window_controls: Vec::new(),
             toolbar_buttons: Vec::new(),
+            settings_index: 0,
             file_pane_ratio: 0.30,
             divider_dragging: false,
             zoom_level: 1.0,
@@ -649,6 +654,15 @@ impl State {
             None => String::from("Discard selected file? [y/Enter] confirm  [Esc] cancel"),
         };
         self.set_status(StatusKind::Prompt, message);
+    }
+
+    fn prompt_settings(&mut self) {
+        self.input_mode = InputMode::Settings;
+        self.settings_index = 0;
+        self.set_status(
+            StatusKind::Prompt,
+            "Settings: Up/Down navigate  Left/Right change  Esc close",
+        );
     }
 
     fn cancel_input_mode(&mut self) {
@@ -1047,6 +1061,90 @@ impl State {
         }
     }
 
+    /// Total number of rows in the settings modal.
+    const SETTINGS_COUNT: usize = 3;
+
+    fn handle_settings_input(&mut self, key: &Key) -> anyhow::Result<bool> {
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.cancel_input_mode();
+                Ok(true)
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if self.settings_index > 0 {
+                    self.settings_index -= 1;
+                }
+                Ok(true)
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if self.settings_index + 1 < Self::SETTINGS_COUNT {
+                    self.settings_index += 1;
+                }
+                Ok(true)
+            }
+            Key::Named(NamedKey::ArrowRight | NamedKey::Enter) => {
+                self.settings_adjust(1)?;
+                Ok(true)
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.settings_adjust(-1)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Adjust the setting at `self.settings_index` by the given direction.
+    fn settings_adjust(&mut self, direction: i32) -> anyhow::Result<()> {
+        match self.settings_index {
+            // 0 = Diff backend
+            0 => {
+                match self.git.toggle_diff_backend() {
+                    Ok(_) => {
+                        self.refresh_document_from_git()?;
+                    }
+                    Err(e) => {
+                        self.set_status(StatusKind::Error, format!("{e}"));
+                    }
+                }
+            }
+            // 1 = Pane ratio
+            1 => {
+                let delta = direction as f32 * 0.05;
+                self.adjust_pane_ratio(delta);
+            }
+            // 2 = Zoom level
+            2 => {
+                let delta = direction as f32 * 0.10;
+                self.apply_zoom(delta);
+            }
+            _ => {}
+        }
+        self.geometry_dirty = true;
+        Ok(())
+    }
+
+    /// Build the label and current value for each settings row.
+    fn settings_row_label(&self, index: usize) -> (&'static str, String) {
+        match index {
+            0 => (
+                "Diff backend",
+                self.git.diff_backend().label().to_string(),
+            ),
+            1 => (
+                "Pane split",
+                format!("{:.0}% / {:.0}%",
+                    self.file_pane_ratio * 100.0,
+                    (1.0 - self.file_pane_ratio) * 100.0),
+            ),
+            2 => (
+                "Zoom level",
+                format!("{:.0}%", self.zoom_level * 100.0),
+            ),
+            _ => ("", String::new()),
+        }
+    }
+
     fn execute_action<F>(&mut self, label: &str, action: F) -> bool
     where
         F: FnOnce(&mut Self) -> anyhow::Result<()>,
@@ -1238,6 +1336,9 @@ impl State {
             }
             InputMode::BranchSwitcher => {
                 self.build_branch_switcher_overlay_geometry(text_vertices, rect_instances)
+            }
+            InputMode::Settings => {
+                self.build_settings_overlay_geometry(text_vertices, rect_instances)
             }
             InputMode::Normal => Ok(()),
         }
@@ -1637,6 +1738,115 @@ impl State {
             &mut hint_x,
             hint_y + self.ascent,
             "Enter checkout  Esc cancel  Up/Down move",
+            [0.76, 0.82, 0.92, 1.0],
+        )?;
+
+        Ok(())
+    }
+
+    fn build_settings_overlay_geometry(
+        &mut self,
+        text_vertices: &mut Vec<TextVertex>,
+        rect_instances: &mut Vec<StyledRectInstance>,
+    ) -> anyhow::Result<()> {
+        let row_count = Self::SETTINGS_COUNT;
+        let panel_h =
+            self.ui(92.0) + row_count as f32 * (self.line_height + self.ui(6.0));
+        let panel = self.modal_panel_rect(panel_h);
+        push_styled_rect(
+            rect_instances,
+            panel,
+            theme::MODAL_BG_TOP,
+            theme::MODAL_BG_BOTTOM,
+            theme::MODAL_BORDER,
+            [0.0, 0.0, 0.0, 0.28],
+            self.ui(12.0),
+            1.0,
+            1.0,
+            self.ui(16.0),
+            [0.0, self.ui(4.0)],
+            self.ui(2.0),
+        );
+
+        // Title
+        let mut x = panel[0] + self.ui(16.0);
+        let mut y = panel[1] + self.ui(18.0);
+        self.append_text_run(
+            text_vertices,
+            &mut x,
+            y + self.ascent,
+            "Settings",
+            [0.92, 0.96, 1.0, 1.0],
+        )?;
+
+        y += self.line_height * 1.4;
+        let row_x = panel[0] + self.ui(14.0);
+        let row_w = panel[2] - self.ui(28.0);
+
+        for idx in 0..row_count {
+            let row_y = y + idx as f32 * (self.line_height + self.ui(6.0));
+            let selected = idx == self.settings_index;
+
+            let (fill_top, fill_bottom, stroke) = if selected {
+                (
+                    [0.25, 0.33, 0.50, 1.0],
+                    [0.18, 0.24, 0.38, 1.0],
+                    [0.52, 0.68, 0.98, 0.70],
+                )
+            } else {
+                (
+                    [0.16, 0.18, 0.26, 1.0],
+                    [0.12, 0.14, 0.20, 1.0],
+                    [0.30, 0.36, 0.48, 0.40],
+                )
+            };
+
+            push_styled_rect(
+                rect_instances,
+                [row_x, row_y, row_w, self.line_height + self.ui(4.0)],
+                fill_top,
+                fill_bottom,
+                stroke,
+                [0.0, 0.0, 0.0, 0.0],
+                self.ui(8.0),
+                1.0,
+                1.0,
+                0.0,
+                [0.0, 0.0],
+                0.0,
+            );
+
+            let (label, value) = self.settings_row_label(idx);
+            let arrows = if selected { "<  >  " } else { "      " };
+            let display = format!("{label}:  {arrows}{value}");
+
+            let text_color = if selected {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.86, 0.90, 0.96, 1.0]
+            };
+
+            let mut tx = row_x + self.ui(10.0);
+            self.append_text_run(
+                text_vertices,
+                &mut tx,
+                row_y + self.ascent + 2.0,
+                &compact_status_message(
+                    &display,
+                    ((row_w - self.ui(20.0)) / self.cell_width).max(1.0) as usize,
+                ),
+                text_color,
+            )?;
+        }
+
+        // Hint bar
+        let mut hint_x = panel[0] + self.ui(16.0);
+        let hint_y = panel[1] + panel[3] - self.line_height + self.ui(4.0);
+        self.append_text_run(
+            text_vertices,
+            &mut hint_x,
+            hint_y + self.ascent,
+            "Left/Right change  Up/Down navigate  Esc close",
             [0.76, 0.82, 0.92, 1.0],
         )?;
 
@@ -3060,6 +3270,22 @@ impl State {
                             Ok(true)
                         }
                     },
+                    "d" => {
+                        Ok(self.execute_action("Diff backend toggled", |state| {
+                            let backend = state.git.toggle_diff_backend()?;
+                            state.refresh_document_from_git()?;
+                            state.set_status(
+                                StatusKind::Success,
+                                format!("Diff backend: {}", backend.label()),
+                            );
+                            Ok(())
+                        }))
+                    }
+                    "," => {
+                        self.prompt_settings();
+                        self.geometry_dirty = true;
+                        Ok(true)
+                    }
                     "r" => self.handle_toolbar_action(ToolbarAction::Refresh),
                     "s" => self.handle_toolbar_action(ToolbarAction::Stage),
                     "u" => self.handle_toolbar_action(ToolbarAction::Unstage),
@@ -3317,6 +3543,9 @@ impl ApplicationHandler for App {
                             InputMode::BranchSwitcher => {
                                 st.handle_branch_switcher_input(&event.logical_key)
                             }
+                            InputMode::Settings => {
+                                st.handle_settings_input(&event.logical_key)
+                            }
                             InputMode::Normal => Ok(false),
                         }
                     } else {
@@ -3350,6 +3579,7 @@ impl ApplicationHandler for App {
                                 InputMode::RepoPicker => "Repo switch failed",
                                 InputMode::DiscardConfirm => "Discard failed",
                                 InputMode::BranchSwitcher => "Branch switch failed",
+                                InputMode::Settings => "Settings failed",
                                 InputMode::Normal => "Input handling failed",
                             };
                             st.set_status(StatusKind::Error, format!("{label}: {err}"));

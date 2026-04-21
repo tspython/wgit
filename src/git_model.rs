@@ -5,6 +5,32 @@ use tree_sitter::{Language, Node, Parser};
 
 use crate::models::{ColorSpan, DiffLineNumber, DocLine, Document, GitViewMeta, LineStyle};
 
+/// Which tool to use for generating diff output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffBackend {
+    #[default]
+    GitDiff,
+    Difftastic,
+}
+
+impl DiffBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GitDiff => "git diff",
+            Self::Difftastic => "difftastic",
+        }
+    }
+}
+
+/// Check whether the `difft` binary is available on PATH.
+fn difft_available() -> bool {
+    Command::new("difft")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GitEntry {
     xy: String,
@@ -340,6 +366,8 @@ pub struct GitModel {
     selected: usize,
     diff: String,
     ts_parser: Parser,
+    diff_backend: DiffBackend,
+    has_difft: bool,
 }
 
 impl GitModel {
@@ -355,6 +383,7 @@ impl GitModel {
             .unwrap_or_else(|| repo.git_dir())
             .to_path_buf();
 
+        let has_difft = difft_available();
         let mut s = Self {
             repo_root,
             branch: String::new(),
@@ -363,6 +392,8 @@ impl GitModel {
             selected: 0,
             diff: String::new(),
             ts_parser: Parser::new(),
+            diff_backend: DiffBackend::default(),
+            has_difft,
         };
 
         s.refresh()?;
@@ -387,6 +418,34 @@ impl GitModel {
 
     pub fn tracking(&self) -> &BranchTrackingStatus {
         &self.tracking
+    }
+
+    pub fn diff_backend(&self) -> DiffBackend {
+        self.diff_backend
+    }
+
+    pub fn has_difft(&self) -> bool {
+        self.has_difft
+    }
+
+    /// Toggle between git-diff and difftastic backends.
+    /// Returns the newly active backend, or an error if difft is not installed.
+    pub fn toggle_diff_backend(&mut self) -> anyhow::Result<DiffBackend> {
+        match self.diff_backend {
+            DiffBackend::GitDiff => {
+                if !self.has_difft {
+                    anyhow::bail!(
+                        "difft not found on PATH. Install: cargo install difftastic"
+                    );
+                }
+                self.diff_backend = DiffBackend::Difftastic;
+            }
+            DiffBackend::Difftastic => {
+                self.diff_backend = DiffBackend::GitDiff;
+            }
+        }
+        self.refresh_diff()?;
+        Ok(self.diff_backend)
     }
 
     pub fn commit(&mut self, message: &str) -> anyhow::Result<()> {
@@ -639,21 +698,32 @@ impl GitModel {
     fn build_diff_document(&mut self) -> anyhow::Result<Document> {
         let mut lines: Vec<DocLine> = Vec::new();
 
-        // Diff file header
+        let backend_label = match self.diff_backend {
+            DiffBackend::GitDiff => "",
+            DiffBackend::Difftastic => " [difftastic]",
+        };
         let diff_title = self
             .entries
             .get(self.selected)
-            .map(|e| format!(" {}", e.path))
+            .map(|e| format!(" {}{}", e.path, backend_label))
             .unwrap_or_else(|| String::from(" No file selected"));
         lines.push(DocLine::new(diff_title, LineStyle::DiffFileHeader));
 
-        // Parse diff lines with line numbers
+        match self.diff_backend {
+            DiffBackend::GitDiff => self.build_diff_document_git(&mut lines)?,
+            DiffBackend::Difftastic => self.build_diff_document_difft(&mut lines),
+        }
+
+        Ok(Document::from_lines(lines))
+    }
+
+    /// Build diff lines from standard unified git-diff output.
+    fn build_diff_document_git(&mut self, lines: &mut Vec<DocLine>) -> anyhow::Result<()> {
         let raw_lines: Vec<String> = self.diff.lines().map(|l| l.to_string()).collect();
         let diff_texts: Vec<String> = raw_lines.iter().map(|l| normalize_for_display(l)).collect();
         let diff_styles: Vec<LineStyle> = raw_lines.iter().map(|l| style_for_diff_line(l)).collect();
         let diff_spans = self.syntax_spans_for_diff_lines(&diff_texts, &diff_styles)?;
 
-        // Track line numbers through hunk headers
         let mut old_line: u32 = 0;
         let mut new_line: u32 = 0;
 
@@ -666,7 +736,6 @@ impl GitModel {
             let raw = &raw_lines[i];
             let ln = match style {
                 LineStyle::DiffHunk => {
-                    // Parse @@ -old,count +new,count @@ ...
                     if let Some((o, n)) = parse_hunk_header(raw) {
                         old_line = o;
                         new_line = n;
@@ -690,7 +759,6 @@ impl GitModel {
                     Some(ln)
                 }
                 LineStyle::Normal => {
-                    // Context line — has both line numbers
                     let ln = DiffLineNumber {
                         old: Some(old_line),
                         new: Some(new_line),
@@ -699,7 +767,7 @@ impl GitModel {
                     new_line += 1;
                     Some(ln)
                 }
-                _ => None, // metadata lines
+                _ => None,
             };
 
             let mut doc_line = DocLine::new(text, style).with_spans(spans);
@@ -707,7 +775,25 @@ impl GitModel {
             lines.push(doc_line);
         }
 
-        Ok(Document::from_lines(lines))
+        Ok(())
+    }
+
+    /// Build diff lines from difftastic inline output.
+    ///
+    /// Difftastic inline output uses ANSI color codes to indicate changes:
+    /// - Red/bold-red line numbers → removed lines
+    /// - Green/bold-green line numbers → added lines
+    /// - No color on line numbers → context lines
+    /// - File path headers and blank lines separate hunks
+    ///
+    /// We parse ANSI codes to classify lines, then strip them for display.
+    fn build_diff_document_difft(&self, lines: &mut Vec<DocLine>) {
+        for raw_line in self.diff.lines() {
+            let style = style_for_difft_line(raw_line);
+            let stripped = strip_ansi_codes(raw_line);
+            let text = normalize_for_display(&stripped);
+            lines.push(DocLine::new(text, style));
+        }
     }
 
     /// Legacy: build a single combined document (kept for backwards compatibility).
@@ -718,6 +804,25 @@ impl GitModel {
 
     fn diff_for_path(&self, path: &str, cached: bool) -> anyhow::Result<String> {
         self.run_git(GitCommand::Diff { path, cached })
+    }
+
+    /// Run `git diff` with `GIT_EXTERNAL_DIFF=difft` to get difftastic output.
+    /// We keep ANSI colors enabled so we can parse them to determine line types.
+    fn difft_diff_for_path(&self, path: &str, cached: bool) -> anyhow::Result<String> {
+        let mut git = Command::new("git");
+        git.arg("-C").arg(&self.repo_root);
+        git.env("GIT_EXTERNAL_DIFF", "difft");
+        git.env("DFT_COLOR", "always");
+        git.env("DFT_DISPLAY", "inline");
+        git.arg("diff");
+        if cached {
+            git.arg("--cached");
+        }
+        git.args(["--", path]);
+
+        let out = git.output().context("failed to spawn difft via git")?;
+        // difft may exit with code 1 when there are differences — that's normal.
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
     pub fn refresh(&mut self) -> anyhow::Result<()> {
@@ -740,8 +845,18 @@ impl GitModel {
             return Ok(());
         };
 
-        let unstaged = self.diff_for_path(&path, false)?;
-        let staged = self.diff_for_path(&path, true)?;
+        let (unstaged, staged) = match self.diff_backend {
+            DiffBackend::GitDiff => {
+                let u = self.diff_for_path(&path, false)?;
+                let s = self.diff_for_path(&path, true)?;
+                (u, s)
+            }
+            DiffBackend::Difftastic => {
+                let u = self.difft_diff_for_path(&path, false)?;
+                let s = self.difft_diff_for_path(&path, true)?;
+                (u, s)
+            }
+        };
 
         let mut out = String::new();
         if !unstaged.trim().is_empty() {
@@ -1250,6 +1365,86 @@ fn style_for_diff_line(line: &str) -> LineStyle {
     }
 }
 
+/// Classify a line of difftastic inline output for styling.
+///
+/// Difftastic uses ANSI color codes to distinguish line types:
+/// - Red (ESC[31m / ESC[1;31m) on line numbers → removed line
+/// - Green (ESC[32m / ESC[1;32m) on line numbers → added line
+/// - Bold (ESC[1m) without red/green → hunk/file header
+/// - No ANSI codes → context or metadata
+fn style_for_difft_line(line: &str) -> LineStyle {
+    let stripped = strip_ansi_codes(line);
+    if stripped.starts_with("# ") {
+        return LineStyle::DiffMeta;
+    }
+    if stripped.trim().is_empty() {
+        return LineStyle::Normal;
+    }
+
+    // Difftastic uses ANSI codes on line numbers to indicate line type.
+    // We check the *start* of the line (before the content) for the line-number color.
+    // Red/bright-red line number = removed, green/bright-green = added.
+    //
+    // The line number is the first non-space token. Removed lines start at column 0,
+    // added lines are indented with spaces (right-side in inline mode).
+    let has_red = line.contains("\x1b[31m")
+        || line.contains("\x1b[1;31m")
+        || line.contains("\x1b[91m")
+        || line.contains("\x1b[91;1m")
+        || line.contains("\x1b[1;91m");
+    let has_green = line.contains("\x1b[32m")
+        || line.contains("\x1b[1;32m")
+        || line.contains("\x1b[92m")
+        || line.contains("\x1b[92;1m")
+        || line.contains("\x1b[1;92m");
+
+    if has_red && !has_green {
+        LineStyle::DiffRemove
+    } else if has_green && !has_red {
+        LineStyle::DiffAdd
+    } else if has_red && has_green {
+        // Both colors present on same line — difftastic shows inline word changes.
+        // Treat as a modification (use DiffAdd since it shows the new state).
+        LineStyle::DiffAdd
+    } else if line.contains("\x1b[1m") || line.contains("\x1b[93m") {
+        // Bold or bright-yellow = file/hunk header
+        LineStyle::DiffHunk
+    } else {
+        LineStyle::Normal
+    }
+}
+
+/// Strip ANSI escape sequences from a string, returning plain text.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip ESC [ ... <final byte>
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // Consume parameter bytes (0x30–0x3F) and intermediate bytes (0x20–0x2F),
+                // then the final byte (0x40–0x7E).
+                loop {
+                    match chars.peek() {
+                        Some(&c) if (0x40..=0x7E).contains(&(c as u32)) => {
+                            chars.next(); // consume final byte
+                            break;
+                        }
+                        Some(_) => {
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Parse `@@ -old,count +new,count @@` → (old_start, new_start)
 fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
     // Format: @@ -<old_start>[,<old_count>] +<new_start>[,<new_count>] @@
@@ -1462,5 +1657,71 @@ not a status line
                 },
             ]
         );
+    }
+
+    #[test]
+    fn strips_ansi_escape_sequences() {
+        assert_eq!(strip_ansi_codes("hello"), "hello");
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi_codes("\x1b[1;32mbold green\x1b[0m"), "bold green");
+        assert_eq!(
+            strip_ansi_codes("\x1b[31m42\x1b[0m   old code"),
+            "42   old code"
+        );
+        assert_eq!(strip_ansi_codes("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn classifies_difft_lines_by_ansi_color() {
+        // Red line number = removed
+        assert!(matches!(
+            style_for_difft_line("\x1b[31m42\x1b[0m   fn old_code()"),
+            LineStyle::DiffRemove
+        ));
+        // Green line number = added
+        assert!(matches!(
+            style_for_difft_line("\x1b[32m42\x1b[0m   fn new_code()"),
+            LineStyle::DiffAdd
+        ));
+        // Bold red = removed
+        assert!(matches!(
+            style_for_difft_line("\x1b[1;31m10\x1b[0m   removed"),
+            LineStyle::DiffRemove
+        ));
+        // Bold green = added
+        assert!(matches!(
+            style_for_difft_line("\x1b[1;32m10\x1b[0m   added"),
+            LineStyle::DiffAdd
+        ));
+        // Bright red (91) = removed (actual difft output)
+        assert!(matches!(
+            style_for_difft_line("\x1b[91;1m783 \x1b[0m   old code"),
+            LineStyle::DiffRemove
+        ));
+        // Bright green (92) = added (actual difft output)
+        assert!(matches!(
+            style_for_difft_line("   \x1b[92;1m783 \x1b[0m   new code"),
+            LineStyle::DiffAdd
+        ));
+        // Dim (context) = normal
+        assert!(matches!(
+            style_for_difft_line("\x1b[2m780 \x1b[0m   context line"),
+            LineStyle::Normal
+        ));
+        // No color = context
+        assert!(matches!(
+            style_for_difft_line("42   context line"),
+            LineStyle::Normal
+        ));
+        // Section header
+        assert!(matches!(
+            style_for_difft_line("# Unstaged"),
+            LineStyle::DiffMeta
+        ));
+        // Bold bright-yellow = file/hunk header (actual difft output)
+        assert!(matches!(
+            style_for_difft_line("\x1b[1m\x1b[93msrc/main.rs\x1b[39m\x1b[0m --- 1/2 --- Rust"),
+            LineStyle::DiffHunk
+        ));
     }
 }
