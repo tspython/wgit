@@ -86,6 +86,9 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
   let blur = max(i.params0.w, 0.5);
   let shadow_offset = i.params1.xy;
   let shadow_spread = i.params1.z;
+  // Glassy top-edge highlight intensity (0 = disabled, ~1 = strong).
+  // Packed into shadow_offset_spread.w; defaults to 0 for legacy callers.
+  let highlight = clamp(i.params1.w, 0.0, 4.0);
 
   let d_fill = sd_round_rect(i.local, i.fill_half, radius);
   let fill_a = 1.0 - smoothstep(0.0, soft, d_fill);
@@ -97,7 +100,47 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
   let border_a = max(fill_a - inner_a, 0.0);
 
   let grad_t = clamp((i.local.y / max(i.fill_half.y, 1.0)) * 0.5 + 0.5, 0.0, 1.0);
-  let fill_color = mix(i.fill_top, i.fill_bottom, grad_t);
+  var fill_color = mix(i.fill_top, i.fill_bottom, grad_t);
+
+  // ── Chrome shading ───────────────────────────────────────────────
+  // A 1 px luminous rim at the top edge, a soft ambient lift that
+  // fades over the upper half, and a 1 px inner shadow at the bottom
+  // edge. Together these sell the "lifted slice" depth for sidebar
+  // items / chrome surfaces. Neutral tint, no hue.
+  if highlight > 0.0001 {
+    let from_top = i.local.y + i.fill_half.y;
+    let from_bottom = i.fill_half.y - i.local.y;
+
+    // 1 px hairline rim at the top
+    let rim_thickness = 1.0;
+    let rim = (1.0 - smoothstep(0.0, rim_thickness, from_top)) * inner_a;
+
+    // Soft ambient brightening fading out over ~half the height
+    let ambient_falloff = max(i.fill_half.y * 0.6, 8.0);
+    let ambient = (1.0 - smoothstep(0.0, ambient_falloff, from_top)) * inner_a;
+
+    // 1 px inner shadow at the bottom (mirror of rim)
+    let bot_thickness = 1.0;
+    let bot = (1.0 - smoothstep(0.0, bot_thickness, from_bottom)) * inner_a;
+
+    let rim_strength = clamp(rim * highlight * 0.40, 0.0, 0.55);
+    let ambient_strength = clamp(ambient * highlight * 0.05, 0.0, 0.14);
+    let bot_strength = clamp(bot * highlight * 0.30, 0.0, 0.42);
+
+    let lift_color = vec3<f32>(1.0, 1.0, 1.0);
+    let shade_color = vec3<f32>(0.0, 0.0, 0.0);
+    fill_color = vec4<f32>(
+      clamp(
+        fill_color.rgb
+          + lift_color * (rim_strength + ambient_strength)
+          - shade_color * 0.0
+          - vec3<f32>(bot_strength) * 0.55,
+        vec3<f32>(0.0),
+        vec3<f32>(1.0)
+      ),
+      fill_color.a
+    );
+  }
 
   let fill_rgba = vec4<f32>(fill_color.rgb, fill_color.a * inner_a);
   let stroke_rgba = vec4<f32>(i.stroke.rgb, i.stroke.a * border_a);
