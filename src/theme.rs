@@ -612,8 +612,8 @@ fn derive_palette(y: &ThemeYaml) -> Palette {
         modal_danger_bg_bottom: rgba(md_bot, 1.0),
         modal_danger_border: rgba(md_border, 0.60),
 
-        tooltip_bg_top: rgba(lerp3(bg, [0.0, 0.0, 0.0], 0.88), 0.98),
-        tooltip_bg_bottom: rgba(lerp3(bg, [0.0, 0.0, 0.0], 0.92), 0.98),
+        tooltip_bg_top: rgba(lerp3(bg, [0.0, 0.0, 0.0], 0.88), 1.0),
+        tooltip_bg_bottom: rgba(lerp3(bg, [0.0, 0.0, 0.0], 0.92), 1.0),
         tooltip_border: rgba([1.0, 1.0, 1.0], 0.12),
         tooltip_text: rgba([0.96, 0.97, 0.99], 1.0),
 
