@@ -19,18 +19,18 @@ pub enum LineStyle {
 impl LineStyle {
     pub fn color(self) -> [f32; 4] {
         match self {
-            Self::Normal => theme::LINE_NORMAL,
-            Self::Dim => theme::LINE_DIM,
-            Self::Header => theme::LINE_HEADER,
-            Self::Selected => theme::LINE_SELECTED,
-            Self::DiffAdd => theme::LINE_DIFF_ADD,
-            Self::DiffRemove => theme::LINE_DIFF_REMOVE,
-            Self::DiffHunk => theme::LINE_DIFF_HUNK,
-            Self::DiffMeta => theme::LINE_DIM,
-            Self::DiffFileHeader => theme::TEXT_ACCENT,
-            Self::SectionStaged => theme::ACCENT_GREEN,
-            Self::SectionUnstaged => theme::ACCENT_YELLOW,
-            Self::SectionUntracked => theme::ACCENT_GRAY,
+            Self::Normal => theme::palette().line_normal,
+            Self::Dim => theme::palette().line_dim,
+            Self::Header => theme::palette().line_header,
+            Self::Selected => theme::palette().line_selected,
+            Self::DiffAdd => theme::palette().line_diff_add,
+            Self::DiffRemove => theme::palette().line_diff_remove,
+            Self::DiffHunk => theme::palette().line_diff_hunk,
+            Self::DiffMeta => theme::palette().line_dim,
+            Self::DiffFileHeader => theme::palette().text_accent,
+            Self::SectionStaged => theme::palette().accent_green,
+            Self::SectionUnstaged => theme::palette().accent_yellow,
+            Self::SectionUntracked => theme::palette().accent_gray,
         }
     }
 
@@ -53,51 +53,51 @@ impl LineStyle {
     pub fn background_colors(self) -> ([f32; 4], [f32; 4], [f32; 4]) {
         match self {
             Self::DiffAdd => (
-                theme::DIFF_ADD_BG_TOP,
-                theme::DIFF_ADD_BG_BOTTOM,
+                theme::palette().diff_add_bg_top,
+                theme::palette().diff_add_bg_bottom,
                 [0.0, 0.0, 0.0, 0.0],
             ),
             Self::DiffRemove => (
-                theme::DIFF_REMOVE_BG_TOP,
-                theme::DIFF_REMOVE_BG_BOTTOM,
+                theme::palette().diff_remove_bg_top,
+                theme::palette().diff_remove_bg_bottom,
                 [0.0, 0.0, 0.0, 0.0],
             ),
             Self::DiffHunk => (
-                theme::DIFF_HUNK_BG_TOP,
-                theme::DIFF_HUNK_BG_BOTTOM,
-                theme::DIFF_HUNK_BORDER,
+                theme::palette().diff_hunk_bg_top,
+                theme::palette().diff_hunk_bg_bottom,
+                theme::palette().diff_hunk_border,
             ),
             Self::DiffMeta => (
-                theme::DIFF_META_BG_TOP,
-                theme::DIFF_META_BG_BOTTOM,
+                theme::palette().diff_meta_bg_top,
+                theme::palette().diff_meta_bg_bottom,
                 [0.0, 0.0, 0.0, 0.0],
             ),
             Self::DiffFileHeader => (
-                theme::DIFF_FILE_HEADER_BG_TOP,
-                theme::DIFF_FILE_HEADER_BG_BOTTOM,
-                theme::DIFF_FILE_HEADER_BORDER,
+                theme::palette().diff_file_header_bg_top,
+                theme::palette().diff_file_header_bg_bottom,
+                theme::palette().diff_file_header_border,
             ),
             Self::SectionStaged => (
-                theme::SECTION_STAGED_BG_TOP,
-                theme::SECTION_STAGED_BG_BOTTOM,
-                theme::SECTION_STAGED_BORDER,
+                theme::palette().section_staged_bg_top,
+                theme::palette().section_staged_bg_bottom,
+                theme::palette().section_staged_border,
             ),
             Self::SectionUnstaged => (
-                theme::SECTION_UNSTAGED_BG_TOP,
-                theme::SECTION_UNSTAGED_BG_BOTTOM,
-                theme::SECTION_UNSTAGED_BORDER,
+                theme::palette().section_unstaged_bg_top,
+                theme::palette().section_unstaged_bg_bottom,
+                theme::palette().section_unstaged_border,
             ),
             Self::SectionUntracked => (
-                theme::SECTION_UNTRACKED_BG_TOP,
-                theme::SECTION_UNTRACKED_BG_BOTTOM,
-                theme::SECTION_UNTRACKED_BORDER,
+                theme::palette().section_untracked_bg_top,
+                theme::palette().section_untracked_bg_bottom,
+                theme::palette().section_untracked_border,
             ),
             _ => ([0.0; 4], [0.0; 4], [0.0; 4]),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolbarAction {
     RepoSwitch,
     Browse,
@@ -112,6 +112,7 @@ pub enum ToolbarAction {
     Unstage,
     UnstageAll,
     Discard,
+    Settings,
     Quit,
 }
 
@@ -125,6 +126,7 @@ pub enum ToolbarGroup {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum WindowControlAction {
     Close,
     Minimize,
@@ -268,7 +270,10 @@ pub struct ButtonStyle {
 
 #[derive(Clone, Debug)]
 pub struct ButtonConfig {
+    /// Human-readable label, kept around for future tooltip / a11y use.
+    #[allow(dead_code)]
     pub label: String,
+    pub icon: &'static str,
     pub action: ToolbarAction,
     pub group: ToolbarGroup,
     pub style: ButtonStyle,

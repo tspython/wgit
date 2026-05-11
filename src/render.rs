@@ -172,6 +172,42 @@ pub fn push_styled_rect(
     shadow_offset: [f32; 2],
     shadow_spread: f32,
 ) {
+    push_styled_rect_glow(
+        out,
+        rect,
+        fill_top,
+        fill_bottom,
+        stroke,
+        shadow,
+        radius,
+        softness,
+        border,
+        shadow_blur,
+        shadow_offset,
+        shadow_spread,
+        0.0,
+    );
+}
+
+/// Same as `push_styled_rect`, but enables the glassy top-edge
+/// highlight rim. `highlight` is intensity in [0, 1] for typical
+/// use; values up to ~2 are clamped in the shader.
+#[allow(clippy::too_many_arguments)]
+pub fn push_styled_rect_glow(
+    out: &mut Vec<StyledRectInstance>,
+    rect: [f32; 4],
+    fill_top: [f32; 4],
+    fill_bottom: [f32; 4],
+    stroke: [f32; 4],
+    shadow: [f32; 4],
+    radius: f32,
+    softness: f32,
+    border: f32,
+    shadow_blur: f32,
+    shadow_offset: [f32; 2],
+    shadow_spread: f32,
+    highlight: f32,
+) {
     if rect[2] <= 0.0 || rect[3] <= 0.0 {
         return;
     }
@@ -183,6 +219,6 @@ pub fn push_styled_rect(
         stroke,
         shadow,
         radius_soft_border_blur: [radius, softness, border, shadow_blur],
-        shadow_offset_spread: [shadow_offset[0], shadow_offset[1], shadow_spread, 0.0],
+        shadow_offset_spread: [shadow_offset[0], shadow_offset[1], shadow_spread, highlight],
     });
 }

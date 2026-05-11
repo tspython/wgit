@@ -1,4 +1,4 @@
-use std::{env, path::Path, path::PathBuf, process::Command};
+use std::{collections::HashMap, env, path::Path, path::PathBuf, process::Command};
 
 use anyhow::Context;
 use tree_sitter::{Language, Node, Parser};
@@ -6,7 +6,7 @@ use tree_sitter::{Language, Node, Parser};
 use crate::models::{ColorSpan, DiffLineNumber, DocLine, Document, GitViewMeta, LineStyle};
 
 /// Which tool to use for generating diff output.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DiffBackend {
     #[default]
     GitDiff,
@@ -368,6 +368,10 @@ pub struct GitModel {
     ts_parser: Parser,
     diff_backend: DiffBackend,
     has_difft: bool,
+    /// Per-(path, backend) cache of `(unstaged, staged)` raw diff text.
+    /// Populated on demand by `refresh_diff` and cleared whenever the
+    /// working tree could have changed (`refresh()`).
+    diff_cache: HashMap<(String, DiffBackend), (String, String)>,
 }
 
 impl GitModel {
@@ -394,6 +398,7 @@ impl GitModel {
             ts_parser: Parser::new(),
             diff_backend: DiffBackend::default(),
             has_difft,
+            diff_cache: HashMap::new(),
         };
 
         s.refresh()?;
@@ -606,7 +611,35 @@ impl GitModel {
 
     fn current_status_entries(&self) -> anyhow::Result<Vec<GitEntry>> {
         let status = self.run_git(GitCommand::StatusPorcelainV1)?;
-        Ok(parse_porcelain_status(&status))
+        let parsed = parse_porcelain_status(&status);
+        let mut entries: Vec<GitEntry> = Vec::with_capacity(parsed.len());
+        for entry in parsed {
+            let kinds = classify_status_xy(&entry.xy);
+            if kinds.len() <= 1 {
+                entries.push(entry);
+                continue;
+            }
+            let chars: Vec<char> = entry.xy.chars().collect();
+            let x = chars.first().copied().unwrap_or(' ');
+            let y = chars.get(1).copied().unwrap_or(' ');
+            for kind in &kinds {
+                let xy = match kind {
+                    StatusSectionKind::Staged => format!("{}{}", x, ' '),
+                    StatusSectionKind::Unstaged => format!("{}{}", ' ', y),
+                    StatusSectionKind::Untracked => entry.xy.clone(),
+                };
+                entries.push(GitEntry {
+                    xy,
+                    path: entry.path.clone(),
+                });
+            }
+        }
+        entries.sort_by_key(|e| {
+            primary_status_section_kind(&e.xy)
+                .map(|k| k.index())
+                .unwrap_or(usize::MAX)
+        });
+        Ok(entries)
     }
 
     #[allow(dead_code)]
@@ -829,6 +862,9 @@ impl GitModel {
         self.branch = self.current_branch()?;
         self.tracking = self.current_tracking(&self.branch)?;
         self.entries = self.current_status_entries()?;
+        // Working tree may have changed for any file — drop the diff
+        // cache so subsequent selections re-fetch.
+        self.diff_cache.clear();
 
         if self.entries.is_empty() {
             self.selected = 0;
@@ -839,11 +875,44 @@ impl GitModel {
         self.refresh_diff()
     }
 
+    /// Compose the rendered `# Unstaged / # Staged` diff buffer from
+    /// the two raw subprocess outputs.
+    fn compose_diff(unstaged: &str, staged: &str) -> String {
+        let mut out = String::new();
+        if !unstaged.trim().is_empty() {
+            out.push_str("# Unstaged\n");
+            out.push_str(unstaged);
+            if !unstaged.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !staged.trim().is_empty() {
+            out.push_str("# Staged\n");
+            out.push_str(staged);
+            if !staged.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if out.trim().is_empty() {
+            out.push_str("No diff output for selected file.");
+        }
+        out
+    }
+
     fn refresh_diff(&mut self) -> anyhow::Result<()> {
         let Some(path) = self.entries.get(self.selected).map(|e| e.path.clone()) else {
             self.diff = String::from("Working tree clean. No changed files.");
             return Ok(());
         };
+
+        // Cache key — file path + backend. The cache is invalidated on
+        // every `refresh()` so it can never go stale relative to the
+        // working tree state we're displaying.
+        let key = (path.clone(), self.diff_backend);
+        if let Some((unstaged, staged)) = self.diff_cache.get(&key) {
+            self.diff = Self::compose_diff(unstaged, staged);
+            return Ok(());
+        }
 
         let (unstaged, staged) = match self.diff_backend {
             DiffBackend::GitDiff => {
@@ -858,25 +927,8 @@ impl GitModel {
             }
         };
 
-        let mut out = String::new();
-        if !unstaged.trim().is_empty() {
-            out.push_str("# Unstaged\n");
-            out.push_str(&unstaged);
-            if !unstaged.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        if !staged.trim().is_empty() {
-            out.push_str("# Staged\n");
-            out.push_str(&staged);
-            if !staged.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        if out.trim().is_empty() {
-            out.push_str("No diff output for selected file.");
-        }
-        self.diff = out;
+        self.diff = Self::compose_diff(&unstaged, &staged);
+        self.diff_cache.insert(key, (unstaged, staged));
         Ok(())
     }
 

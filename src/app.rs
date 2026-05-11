@@ -1,4 +1,9 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ab_glyph::{Font, FontArc, Glyph, GlyphId, PxScale, ScaleFont, point};
 use anyhow::Context;
@@ -19,14 +24,15 @@ use crate::models::{
 };
 use crate::render::{
     Atlas, GlyphCache, GlyphKey, GlyphUV, QuadVertex, StyledRectInstance, TextVertex, Uniforms,
-    create_empty_buffer, create_vertex_buffer, push_styled_rect,
+    create_empty_buffer, create_vertex_buffer, push_styled_rect, push_styled_rect_glow,
 };
 use crate::repo_store;
 use crate::theme::{
-    self, ATLAS_SIZE, COLOR_BG, COLOR_ROW_SELECTED, COLOR_ROW_SELECTED_BORDER,
-    COLOR_ROW_SELECTED_BOTTOM, COLOR_SELECTION_ACCENT_BAR, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP,
-    STATUS_BAR_HEIGHT, STATUS_BAR_SIDE_PADDING, TOP_PADDING,
+    self, ATLAS_SIZE, FONT_PX, SIDE_PADDING, STATUS_BAR_GAP, STATUS_BAR_HEIGHT,
+    STATUS_BAR_SIDE_PADDING, TOP_PADDING,
 };
+
+const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug)]
 enum StatusKind {
@@ -84,6 +90,7 @@ struct State {
 
     atlas: Atlas,
     glyph_cache: GlyphCache,
+    icons: std::collections::HashMap<&'static str, GlyphUV>,
     font: FontArc,
     cell_width: f32,
     line_height: f32,
@@ -128,8 +135,13 @@ struct State {
     window_controls: Vec<WindowControlButton>,
     toolbar_buttons: Vec<ToolbarButton>,
 
+    hover_toolbar_action: Option<ToolbarAction>,
+    hover_started_at: Option<Instant>,
+    tooltip_drawn: bool,
+
     // ── Settings modal ───────────────────────────────────
     settings_index: usize,
+    theme_index: usize,
 
     // ── Panel split ratio ────────────────────────────────
     file_pane_ratio: f32,
@@ -436,6 +448,7 @@ impl State {
             uniform_bg,
             atlas,
             glyph_cache,
+            icons: std::collections::HashMap::new(),
             font,
             cell_width: FONT_PX * ui_scale,
             line_height: FONT_PX * ui_scale * 1.3,
@@ -469,7 +482,14 @@ impl State {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             window_controls: Vec::new(),
             toolbar_buttons: Vec::new(),
+            hover_toolbar_action: None,
+            hover_started_at: None,
+            tooltip_drawn: false,
             settings_index: 0,
+            theme_index: theme::bundled_names()
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(theme::palette().name))
+                .unwrap_or(0),
             file_pane_ratio: 0.30,
             divider_dragging: false,
             zoom_level: 1.0,
@@ -485,6 +505,7 @@ impl State {
         state.configure_surface();
         state.update_uniform_screen();
         state.compute_font_metrics();
+        state.load_toolbar_icons()?;
         state.refresh_recent_repos();
         state.refresh_repo_tracking()?;
         state.rebuild_layout();
@@ -577,10 +598,10 @@ impl State {
 
     fn status_fill(&self) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) {
         match self.status.kind {
-            StatusKind::Neutral => theme::STATUS_NEUTRAL,
-            StatusKind::Success => theme::STATUS_SUCCESS,
-            StatusKind::Error => theme::STATUS_ERROR,
-            StatusKind::Prompt => theme::STATUS_PROMPT,
+            StatusKind::Neutral => theme::palette().status_neutral,
+            StatusKind::Success => theme::palette().status_success,
+            StatusKind::Error => theme::palette().status_error,
+            StatusKind::Prompt => theme::palette().status_prompt,
         }
     }
 
@@ -1062,7 +1083,7 @@ impl State {
     }
 
     /// Total number of rows in the settings modal.
-    const SETTINGS_COUNT: usize = 3;
+    const SETTINGS_COUNT: usize = 4;
 
     fn handle_settings_input(&mut self, key: &Key) -> anyhow::Result<bool> {
         match key {
@@ -1073,12 +1094,14 @@ impl State {
             Key::Named(NamedKey::ArrowUp) => {
                 if self.settings_index > 0 {
                     self.settings_index -= 1;
+                    self.geometry_dirty = true;
                 }
                 Ok(true)
             }
             Key::Named(NamedKey::ArrowDown) => {
                 if self.settings_index + 1 < Self::SETTINGS_COUNT {
                     self.settings_index += 1;
+                    self.geometry_dirty = true;
                 }
                 Ok(true)
             }
@@ -1118,10 +1141,31 @@ impl State {
                 let delta = direction as f32 * 0.10;
                 self.apply_zoom(delta);
             }
+            // 3 = Theme
+            3 => {
+                self.cycle_theme(direction);
+            }
             _ => {}
         }
         self.geometry_dirty = true;
         Ok(())
+    }
+
+    /// Step through the bundled themes by `direction` (-1 / +1) and
+    /// install the chosen palette atomically. The next `geometry_dirty`
+    /// frame redraws every chrome surface in the new colors.
+    fn cycle_theme(&mut self, direction: i32) {
+        let names = theme::bundled_names();
+        if names.is_empty() {
+            return;
+        }
+        let n = names.len() as i32;
+        let cur = self.theme_index as i32;
+        let next = (cur + direction).rem_euclid(n) as usize;
+        if let Some(p) = theme::bundled(names[next]) {
+            theme::set_palette(p);
+            self.theme_index = next;
+        }
     }
 
     /// Build the label and current value for each settings row.
@@ -1141,6 +1185,7 @@ impl State {
                 "Zoom level",
                 format!("{:.0}%", self.zoom_level * 100.0),
             ),
+            3 => ("Theme", theme::palette().name.to_string()),
             _ => ("", String::new()),
         }
     }
@@ -1207,6 +1252,11 @@ impl State {
             })),
             ToolbarAction::Discard => {
                 self.prompt_discard_confirm();
+                Ok(true)
+            }
+            ToolbarAction::Settings => {
+                self.prompt_settings();
+                self.geometry_dirty = true;
                 Ok(true)
             }
             ToolbarAction::Fetch => Ok(self.execute_action("Repository fetched", |state| {
@@ -1306,14 +1356,16 @@ impl State {
             return Ok(());
         }
 
-        // Full-screen dimming scrim behind all modals
+        // Full-screen dimming scrim behind all modals — opaque enough
+        // that the underlying chrome reads as backgrounded rather than
+        // competing with the modal for attention.
         let w = self.size.width as f32;
         let h = self.size.height as f32;
         push_styled_rect(
             rect_instances,
             [0.0, 0.0, w, h],
-            [0.0, 0.0, 0.0, 0.55],
-            [0.0, 0.0, 0.0, 0.65],
+            [0.0, 0.0, 0.0, 0.72],
+            [0.0, 0.0, 0.0, 0.80],
             [0.0; 4],
             [0.0; 4],
             0.0,
@@ -1350,12 +1402,12 @@ impl State {
         rect_instances: &mut Vec<StyledRectInstance>,
     ) -> anyhow::Result<()> {
         let panel = self.modal_panel_rect(self.ui(134.0));
-        push_styled_rect(
+        push_styled_rect_glow(
             rect_instances,
             panel,
-            theme::MODAL_BG_TOP,
-            theme::MODAL_BG_BOTTOM,
-            theme::MODAL_BORDER,
+            theme::palette().modal_bg_top,
+            theme::palette().modal_bg_bottom,
+            theme::palette().modal_border,
             [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
@@ -1363,6 +1415,7 @@ impl State {
             self.ui(16.0),
             [0.0, self.ui(4.0)],
             self.ui(2.0),
+            0.25,
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1481,12 +1534,12 @@ impl State {
         let visible_count = visible_end.saturating_sub(visible_start);
         let panel_h = self.ui(92.0) + visible_count as f32 * (self.line_height + self.ui(6.0));
         let panel = self.modal_panel_rect(panel_h);
-        push_styled_rect(
+        push_styled_rect_glow(
             rect_instances,
             panel,
-            theme::MODAL_BG_TOP,
-            theme::MODAL_BG_BOTTOM,
-            theme::MODAL_BORDER,
+            theme::palette().modal_bg_top,
+            theme::palette().modal_bg_bottom,
+            theme::palette().modal_border,
             [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
@@ -1494,6 +1547,7 @@ impl State {
             self.ui(16.0),
             [0.0, self.ui(4.0)],
             self.ui(2.0),
+            0.25,
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1582,12 +1636,12 @@ impl State {
         rect_instances: &mut Vec<StyledRectInstance>,
     ) -> anyhow::Result<()> {
         let panel = self.modal_panel_rect(self.ui(108.0));
-        push_styled_rect(
+        push_styled_rect_glow(
             rect_instances,
             panel,
-            theme::MODAL_DANGER_BG_TOP,
-            theme::MODAL_DANGER_BG_BOTTOM,
-            theme::MODAL_DANGER_BORDER,
+            theme::palette().modal_danger_bg_top,
+            theme::palette().modal_danger_bg_bottom,
+            theme::palette().modal_danger_border,
             [0.0, 0.0, 0.0, 0.32],
             self.ui(12.0),
             1.0,
@@ -1595,6 +1649,7 @@ impl State {
             self.ui(16.0),
             [0.0, self.ui(4.0)],
             self.ui(2.0),
+            0.25,
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1645,12 +1700,12 @@ impl State {
         let visible_count = visible_end.saturating_sub(visible_start);
         let panel_h = self.ui(92.0) + visible_count as f32 * (self.line_height + self.ui(6.0));
         let panel = self.modal_panel_rect(panel_h);
-        push_styled_rect(
+        push_styled_rect_glow(
             rect_instances,
             panel,
-            theme::MODAL_BG_TOP,
-            theme::MODAL_BG_BOTTOM,
-            theme::MODAL_BORDER,
+            theme::palette().modal_bg_top,
+            theme::palette().modal_bg_bottom,
+            theme::palette().modal_border,
             [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
@@ -1658,6 +1713,7 @@ impl State {
             self.ui(16.0),
             [0.0, self.ui(4.0)],
             self.ui(2.0),
+            0.25,
         );
 
         let mut x = panel[0] + self.ui(16.0);
@@ -1713,7 +1769,7 @@ impl State {
                 label.push_str("  (current)");
             }
             let text_color = if is_current && !selected {
-                theme::BRANCH_CURRENT_BADGE
+                theme::palette().branch_current_badge
             } else if selected {
                 [1.0, 1.0, 1.0, 1.0]
             } else {
@@ -1753,12 +1809,12 @@ impl State {
         let panel_h =
             self.ui(92.0) + row_count as f32 * (self.line_height + self.ui(6.0));
         let panel = self.modal_panel_rect(panel_h);
-        push_styled_rect(
+        push_styled_rect_glow(
             rect_instances,
             panel,
-            theme::MODAL_BG_TOP,
-            theme::MODAL_BG_BOTTOM,
-            theme::MODAL_BORDER,
+            theme::palette().modal_bg_top,
+            theme::palette().modal_bg_bottom,
+            theme::palette().modal_border,
             [0.0, 0.0, 0.0, 0.28],
             self.ui(12.0),
             1.0,
@@ -1766,6 +1822,7 @@ impl State {
             self.ui(16.0),
             [0.0, self.ui(4.0)],
             self.ui(2.0),
+            0.25,
         );
 
         // Title
@@ -2071,6 +2128,172 @@ impl State {
         Ok(Some(uv))
     }
 
+    /// Bundled toolbar icons. Each entry maps a logical icon name to a
+    /// raw SVG file embedded at compile time.
+    fn icon_sources() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("plus", include_str!("../assets/icons/plus.svg")),
+            ("minus", include_str!("../assets/icons/minus.svg")),
+            (
+                "plus-circle",
+                include_str!("../assets/icons/plus-circle.svg"),
+            ),
+            (
+                "minus-circle",
+                include_str!("../assets/icons/minus-circle.svg"),
+            ),
+            (
+                "arrow-up",
+                include_str!("../assets/icons/arrow-narrow-up.svg"),
+            ),
+            (
+                "arrow-down",
+                include_str!("../assets/icons/arrow-narrow-down.svg"),
+            ),
+            ("download", include_str!("../assets/icons/download-01.svg")),
+            ("commit", include_str!("../assets/icons/git-commit.svg")),
+            ("trash", include_str!("../assets/icons/trash-02.svg")),
+            ("folder", include_str!("../assets/icons/folder.svg")),
+            (
+                "folder-closed",
+                include_str!("../assets/icons/folder-closed.svg"),
+            ),
+            (
+                "git-branch",
+                include_str!("../assets/icons/git-branch-02.svg"),
+            ),
+            (
+                "refresh",
+                include_str!("../assets/icons/refresh-ccw-01.svg"),
+            ),
+            ("settings", include_str!("../assets/icons/settings.svg")),
+            ("close", include_str!("../assets/icons/x-close.svg")),
+        ]
+    }
+
+    /// Rasterize every bundled icon at the current DPI and upload each
+    /// into the shared glyph atlas. Called once at startup.
+    fn load_toolbar_icons(&mut self) -> anyhow::Result<()> {
+        // Render at the same nominal cell size we'll display at, so we
+        // don't blur from scale-up. 18 px nominal × ui_scale matches the
+        // toolbar text height.
+        let target = (18.0 * self.ui_scale).round().max(8.0) as u32;
+        let pad = 1u32;
+
+        for (name, svg) in Self::icon_sources() {
+            let Some(d) = crate::icon::extract_path_d(svg) else {
+                continue;
+            };
+            let (_vx, _vy, vw, vh) = crate::icon::extract_viewbox(svg);
+            let path = crate::icon::parse_path(d);
+
+            let alpha = crate::icon::rasterize_filled(&path, vw, vh, target, target);
+
+            let gw = target + pad * 2;
+            let gh = target + pad * 2;
+            let (x, y) = self
+                .atlas
+                .alloc(gw, gh)
+                .context("icon atlas full while loading toolbar icons")?;
+
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let bpr = gw.next_multiple_of(align);
+            let mut tmp = vec![0u8; (bpr * gh) as usize];
+            for row in 0..target {
+                let src = (row * target) as usize;
+                let dst = ((row + pad) * bpr + pad) as usize;
+                tmp[dst..dst + target as usize]
+                    .copy_from_slice(&alpha[src..src + target as usize]);
+            }
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &tmp,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(gh),
+                },
+                wgpu::Extent3d {
+                    width: gw,
+                    height: gh,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let uv = GlyphUV {
+                u0: (x + pad) as f32 / self.atlas.w as f32,
+                v0: (y + pad) as f32 / self.atlas.h as f32,
+                u1: (x + pad + target) as f32 / self.atlas.w as f32,
+                v1: (y + pad + target) as f32 / self.atlas.h as f32,
+                w: target,
+                h: target,
+                bearing_x: 0.0,
+                bearing_y: 0.0,
+            };
+            self.icons.insert(name, uv);
+        }
+
+        Ok(())
+    }
+
+    /// Emit a textured quad for the named icon at logical (x, y) of the
+    /// given pixel size, tinted by `color`. Same single-channel R8 +
+    /// color path as text rendering, so it goes straight into the
+    /// existing text pipeline.
+    fn append_icon(
+        &self,
+        out: &mut Vec<TextVertex>,
+        x: f32,
+        y: f32,
+        size: f32,
+        name: &str,
+        color: [f32; 4],
+    ) {
+        let Some(uv) = self.icons.get(name).copied() else {
+            return;
+        };
+        let x0 = x.round();
+        let y0 = y.round();
+        let x1 = x0 + size;
+        let y1 = y0 + size;
+        out.push(TextVertex {
+            pos: [x0, y0],
+            uv: [uv.u0, uv.v0],
+            color,
+        });
+        out.push(TextVertex {
+            pos: [x1, y0],
+            uv: [uv.u1, uv.v0],
+            color,
+        });
+        out.push(TextVertex {
+            pos: [x0, y1],
+            uv: [uv.u0, uv.v1],
+            color,
+        });
+        out.push(TextVertex {
+            pos: [x0, y1],
+            uv: [uv.u0, uv.v1],
+            color,
+        });
+        out.push(TextVertex {
+            pos: [x1, y0],
+            uv: [uv.u1, uv.v0],
+            color,
+        });
+        out.push(TextVertex {
+            pos: [x1, y1],
+            uv: [uv.u1, uv.v1],
+            color,
+        });
+    }
+
     fn selected_file_line_index(&self) -> Option<usize> {
         self.file_index_to_line
             .get(self.git.selected_index())
@@ -2200,12 +2423,12 @@ impl State {
         let bw = bar[2];
         let bh = bar[3];
 
-        // Titlebar background
-        push_styled_rect(
+        // Titlebar background — subtle top-edge chrome lift
+        push_styled_rect_glow(
             rect_instances,
             bar,
-            theme::COLOR_TITLEBAR_TOP,
-            theme::COLOR_TITLEBAR_BOTTOM,
+            theme::palette().titlebar_top,
+            theme::palette().titlebar_bottom,
             [0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0,
@@ -2214,14 +2437,15 @@ impl State {
             0.0,
             [0.0, 0.0],
             0.0,
+            0.20,
         );
 
         // Bottom divider line for titlebar
         push_styled_rect(
             rect_instances,
             [bx, by + bh - 1.0, bw, 1.0],
-            theme::DIVIDER_COLOR,
-            theme::DIVIDER_COLOR,
+            theme::palette().divider,
+            theme::palette().divider,
             [0.0; 4],
             [0.0; 4],
             0.0,
@@ -2232,57 +2456,71 @@ impl State {
             0.0,
         );
 
-        let controls = [
-            (
-                WindowControlAction::Close,
-                [0.95, 0.41, 0.38, 0.96],
-                [0.77, 0.26, 0.24, 0.96],
-            ),
-            (
-                WindowControlAction::Minimize,
-                [0.98, 0.78, 0.41, 0.96],
-                [0.84, 0.63, 0.25, 0.96],
-            ),
-            (
-                WindowControlAction::Zoom,
-                [0.40, 0.83, 0.49, 0.96],
-                [0.26, 0.68, 0.34, 0.96],
-            ),
-        ];
+        // On macOS we let the native window draw its real traffic lights
+        // (via NSWindow + titlebar_transparent + fullsize_content_view).
+        // We just paint our titlebar bg behind them and leave clearance.
+        // On other platforms we still draw our own controls.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let controls = [
+                (
+                    WindowControlAction::Close,
+                    [0.95, 0.41, 0.38, 0.96],
+                    [0.77, 0.26, 0.24, 0.96],
+                ),
+                (
+                    WindowControlAction::Minimize,
+                    [0.98, 0.78, 0.41, 0.96],
+                    [0.84, 0.63, 0.25, 0.96],
+                ),
+                (
+                    WindowControlAction::Zoom,
+                    [0.40, 0.83, 0.49, 0.96],
+                    [0.26, 0.68, 0.34, 0.96],
+                ),
+            ];
 
-        let mut cx = bx + self.ui(14.0);
-        let cy = by + bh * 0.5;
-        let d = self.ui(12.0);
-        for (action, top, bottom) in controls {
-            let x0 = cx - d * 0.5;
-            let y0 = cy - d * 0.5;
-            push_styled_rect(
-                rect_instances,
-                [x0, y0, d, d],
-                top,
-                bottom,
-                [0.0, 0.0, 0.0, 0.22],
-                [0.0, 0.0, 0.0, 0.18],
-                self.ui(6.0),
-                1.0,
-                self.ui(0.8),
-                self.ui(2.0),
-                [0.0, self.ui(0.5)],
-                0.0,
-            );
-            self.window_controls.push(WindowControlButton {
-                x0,
-                y0,
-                x1: x0 + d,
-                y1: y0 + d,
-                action,
-            });
-            cx += self.ui(18.0);
+            let mut cx = bx + self.ui(14.0);
+            let cy = by + bh * 0.5;
+            let d = self.ui(12.0);
+            for (action, top, bottom) in controls {
+                let x0 = cx - d * 0.5;
+                let y0 = cy - d * 0.5;
+                push_styled_rect(
+                    rect_instances,
+                    [x0, y0, d, d],
+                    top,
+                    bottom,
+                    [0.0, 0.0, 0.0, 0.22],
+                    [0.0, 0.0, 0.0, 0.18],
+                    self.ui(6.0),
+                    1.0,
+                    self.ui(0.8),
+                    self.ui(2.0),
+                    [0.0, self.ui(0.5)],
+                    0.0,
+                );
+                self.window_controls.push(WindowControlButton {
+                    x0,
+                    y0,
+                    x1: x0 + d,
+                    y1: y0 + d,
+                    action,
+                });
+                cx += self.ui(18.0);
+            }
         }
 
-        // Build titlebar content: "wgit" brand + repo path + branch badge
+        // Build titlebar content: "wgit" brand + repo path + branch badge.
+        // macOS native traffic lights occupy roughly the first 80 logical
+        // px of the titlebar, so we clear them with an extra inset there.
         let baseline = by + (bh - self.line_height) * 0.5 + self.ascent;
-        let mut x = bx + self.ui(68.0); // After window controls
+        let brand_inset = if cfg!(target_os = "macos") {
+            self.ui(86.0)
+        } else {
+            self.ui(68.0)
+        };
+        let mut x = bx + brand_inset;
 
         // Brand name
         self.append_text_run(
@@ -2290,7 +2528,7 @@ impl State {
             &mut x,
             baseline,
             "wgit",
-            theme::TEXT_ACCENT,
+            theme::palette().text_accent,
         )?;
         x += self.cell_width;
 
@@ -2306,24 +2544,46 @@ impl State {
             &mut x,
             baseline,
             &repo_name,
-            theme::TEXT_SECONDARY,
+            theme::palette().text_secondary,
         )?;
         x += self.cell_width * 2.0;
 
-        // Branch badge with background chip
-        let branch = self.repo_tracking.branch.clone();
-        let branch_label = format!("\u{E0A0} {}", branch); //
-        let branch_chars = branch_label.chars().count() as f32;
-        let chip_w = branch_chars * self.cell_width + self.ui(14.0);
+        // Branch badge with background chip.
+        // We render the text first to capture its actual advance, then
+        // push the chip rect sized from that. The render pass draws all
+        // rects before any text, so the chip still appears *behind* the
+        // glyphs visually even though it's pushed afterwards. This way
+        // the chip can never desync from the text width.
+        // The Powerline branch glyph (`\u{E0A0}`) isn't present in the
+        // bundled Hack font, so prefixing it would consume two cells of
+        // layout advance while drawing nothing — leaving a phantom gap
+        // on the left of the chip. Skip the prefix; the chip's
+        // placement is identification enough.
+        let branch = self.repo_tracking.branch.trim().to_string();
+        let branch_label = branch.clone();
         let chip_h = self.line_height - self.ui(4.0);
         let chip_y = by + (bh - chip_h) * 0.5;
+        let pad_x = self.ui(8.0);
 
-        push_styled_rect(
+        let text_x_start = x;
+        self.append_text_run(
+            text_vertices,
+            &mut x,
+            baseline,
+            &branch_label,
+            theme::palette().accent_blue,
+        )?;
+        let text_advance = x - text_x_start;
+
+        let chip_x = (text_x_start - pad_x).round();
+        let chip_w = (text_advance + pad_x * 2.0).round();
+
+        push_styled_rect_glow(
             rect_instances,
-            [x - self.ui(7.0), chip_y, chip_w, chip_h],
-            [0.18, 0.24, 0.38, 0.70],
-            [0.14, 0.18, 0.30, 0.65],
-            theme::ACCENT_BLUE_DIM,
+            [chip_x, chip_y, chip_w, chip_h],
+            theme::palette().branch_chip_bg_top,
+            theme::palette().branch_chip_bg_bottom,
+            theme::palette().accent_blue_dim,
             [0.0; 4],
             self.ui(5.0),
             1.0,
@@ -2331,15 +2591,9 @@ impl State {
             0.0,
             [0.0, 0.0],
             0.0,
+            0.30,
         );
 
-        self.append_text_run(
-            text_vertices,
-            &mut x,
-            baseline,
-            &branch_label,
-            theme::ACCENT_BLUE,
-        )?;
         x += self.cell_width;
 
         // Ahead/behind indicators
@@ -2350,7 +2604,7 @@ impl State {
                 &mut x,
                 baseline,
                 &ahead_text,
-                theme::ACCENT_GREEN,
+                theme::palette().accent_green,
             )?;
             x += self.cell_width;
         }
@@ -2361,7 +2615,7 @@ impl State {
                 &mut x,
                 baseline,
                 &behind_text,
-                theme::ACCENT_RED,
+                theme::palette().accent_red,
             )?;
         };
 
@@ -2373,124 +2627,145 @@ impl State {
             fill_top: [0.16, 0.28, 0.20, 0.50],
             fill_bottom: [0.12, 0.22, 0.16, 0.45],
             stroke: [0.36, 0.68, 0.46, 0.50],
-            text: theme::ACCENT_GREEN,
+            text: theme::palette().accent_green,
         };
         let blue_btn = ButtonStyle {
             fill_top: [0.16, 0.22, 0.36, 0.50],
             fill_bottom: [0.12, 0.17, 0.28, 0.45],
             stroke: [0.36, 0.50, 0.78, 0.50],
-            text: theme::ACCENT_BLUE,
+            text: theme::palette().accent_blue,
         };
         let purple_btn = ButtonStyle {
             fill_top: [0.22, 0.17, 0.34, 0.50],
             fill_bottom: [0.17, 0.13, 0.26, 0.45],
             stroke: [0.50, 0.40, 0.78, 0.50],
-            text: theme::ACCENT_PURPLE,
+            text: theme::palette().accent_purple,
         };
         let yellow_btn = ButtonStyle {
             fill_top: [0.28, 0.24, 0.14, 0.50],
             fill_bottom: [0.22, 0.18, 0.10, 0.45],
             stroke: [0.68, 0.56, 0.30, 0.50],
-            text: theme::ACCENT_YELLOW,
+            text: theme::palette().accent_yellow,
         };
         let red_btn = ButtonStyle {
             fill_top: [0.32, 0.14, 0.14, 0.60],
             fill_bottom: [0.26, 0.10, 0.10, 0.55],
             stroke: [0.78, 0.34, 0.34, 0.60],
-            text: theme::ACCENT_RED,
+            text: theme::palette().accent_red,
         };
         let gray_btn = ButtonStyle {
             fill_top: [0.18, 0.18, 0.20, 0.40],
             fill_bottom: [0.14, 0.14, 0.16, 0.35],
             stroke: [0.40, 0.40, 0.44, 0.35],
-            text: theme::TEXT_SECONDARY,
+            text: theme::palette().text_secondary,
         };
 
         vec![
             // ── Staging group ─────────────────────
             ButtonConfig {
-                label: String::from("s stage"),
+                label: String::from("Stage (s)"),
+                icon: "plus",
                 action: ToolbarAction::Stage,
                 group: ToolbarGroup::Staging,
                 style: green_btn,
             },
             ButtonConfig {
-                label: String::from("a all"),
+                label: String::from("Stage all (a)"),
+                icon: "plus-circle",
                 action: ToolbarAction::StageAll,
                 group: ToolbarGroup::Staging,
                 style: green_btn,
             },
             ButtonConfig {
-                label: String::from("u unstage"),
+                label: String::from("Unstage (u)"),
+                icon: "minus",
                 action: ToolbarAction::Unstage,
                 group: ToolbarGroup::Staging,
                 style: yellow_btn,
             },
             ButtonConfig {
-                label: String::from("U all"),
+                label: String::from("Unstage all (U)"),
+                icon: "minus-circle",
                 action: ToolbarAction::UnstageAll,
                 group: ToolbarGroup::Staging,
                 style: yellow_btn,
             },
             // ── Git ops group ─────────────────────
             ButtonConfig {
-                label: String::from("c commit"),
+                label: String::from("Commit (c)"),
+                icon: "commit",
                 action: ToolbarAction::Commit,
                 group: ToolbarGroup::GitOps,
                 style: blue_btn,
             },
             ButtonConfig {
-                label: String::from("f fetch"),
+                label: String::from("Fetch (f)"),
+                icon: "download",
                 action: ToolbarAction::Fetch,
                 group: ToolbarGroup::GitOps,
                 style: purple_btn,
             },
             ButtonConfig {
-                label: String::from("p pull"),
+                label: String::from("Pull (p)"),
+                icon: "arrow-down",
                 action: ToolbarAction::Pull,
                 group: ToolbarGroup::GitOps,
                 style: purple_btn,
             },
             ButtonConfig {
-                label: String::from("P push"),
+                label: String::from("Push (P)"),
+                icon: "arrow-up",
                 action: ToolbarAction::Push,
                 group: ToolbarGroup::GitOps,
                 style: purple_btn,
             },
             // ── Danger group ──────────────────────
             ButtonConfig {
-                label: String::from("x discard"),
+                label: String::from("Discard (x)"),
+                icon: "trash",
                 action: ToolbarAction::Discard,
                 group: ToolbarGroup::Danger,
                 style: red_btn,
             },
             // ── App group ─────────────────────────
             ButtonConfig {
-                label: String::from("o repos"),
+                label: String::from("Repos (o)"),
+                icon: "folder-closed",
                 action: ToolbarAction::RepoSwitch,
                 group: ToolbarGroup::App,
                 style: gray_btn,
             },
             ButtonConfig {
-                label: String::from("b browse"),
+                label: String::from("Browse (b)"),
+                icon: "folder",
                 action: ToolbarAction::Browse,
                 group: ToolbarGroup::App,
                 style: gray_btn,
             },
             ButtonConfig {
-                label: String::from("B branch"),
+                label: String::from("Branch (B)"),
+                icon: "git-branch",
                 action: ToolbarAction::BranchSwitch,
                 group: ToolbarGroup::App,
                 style: gray_btn,
             },
             ButtonConfig {
-                label: String::from("r refresh"),
+                label: String::from("Refresh (r)"),
+                icon: "refresh",
                 action: ToolbarAction::Refresh,
                 group: ToolbarGroup::App,
                 style: gray_btn,
             },
             ButtonConfig {
-                label: String::from("q quit"),
+                label: String::from("Settings (,)"),
+                icon: "settings",
+                action: ToolbarAction::Settings,
+                group: ToolbarGroup::App,
+                style: gray_btn,
+            },
+            ButtonConfig {
+                label: String::from("Quit (q)"),
+                icon: "close",
                 action: ToolbarAction::Quit,
                 group: ToolbarGroup::App,
                 style: gray_btn,
@@ -2511,12 +2786,12 @@ impl State {
         let bw = bar[2];
         let bh = bar[3];
 
-        // Toolbar background
-        push_styled_rect(
+        // Toolbar background — barely-there lift, weaker than titlebar
+        push_styled_rect_glow(
             rect_instances,
             bar,
-            theme::COLOR_TOOLBAR_TOP,
-            theme::COLOR_TOOLBAR_BOTTOM,
+            theme::palette().toolbar_top,
+            theme::palette().toolbar_bottom,
             [0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0,
@@ -2525,14 +2800,15 @@ impl State {
             0.0,
             [0.0, 0.0],
             0.0,
+            0.12,
         );
 
         // Bottom divider
         push_styled_rect(
             rect_instances,
             [bx, by + bh - 1.0, bw, 1.0],
-            theme::DIVIDER_COLOR,
-            theme::DIVIDER_COLOR,
+            theme::palette().divider,
+            theme::palette().divider,
             [0.0; 4],
             [0.0; 4],
             0.0,
@@ -2544,28 +2820,28 @@ impl State {
         );
 
         let mut x = bx + self.ui(14.0);
-        let baseline = by + (bh - self.line_height) * 0.5 + self.ascent;
         let text_max_x = bx + bw - self.ui(14.0);
 
         let buttons = self.toolbar_button_configs();
         let mut prev_group: Option<ToolbarGroup> = None;
-        let chip_pad_h = self.ui(8.0); // horizontal padding inside chip, each side
-        let chip_gap = self.ui(4.0); // gap between chips in same group
-        let group_gap = self.ui(14.0); // gap between groups (including separator)
+        let icon_px = self.ui(18.0); // logical icon size
+        let chip_pad = self.ui(7.0); // padding around the icon, each side
+        let chip_w = icon_px + chip_pad * 2.0;
+        let chip_h = (bh - self.ui(14.0)).max(icon_px + chip_pad);
+        let chip_gap = self.ui(4.0);
+        let group_gap = self.ui(14.0);
 
         for button in buttons {
-            // Add separator between groups
             if let Some(pg) = prev_group {
                 if pg != button.group {
-                    // Vertical separator line between button groups
                     let sep_x = x + (group_gap * 0.5);
                     let sep_y = by + self.ui(12.0);
                     let sep_h = bh - self.ui(24.0);
                     push_styled_rect(
                         rect_instances,
                         [sep_x, sep_y, 1.0, sep_h],
-                        theme::TOOLBAR_SEPARATOR,
-                        theme::TOOLBAR_SEPARATOR,
+                        theme::palette().toolbar_separator,
+                        theme::palette().toolbar_separator,
                         [0.0; 4],
                         [0.0; 4],
                         0.0,
@@ -2581,16 +2857,12 @@ impl State {
                 }
             }
 
-            let label_w = button.label.chars().count() as f32 * self.cell_width;
-            let chip_w = label_w + chip_pad_h * 2.0;
-
             if x + chip_w > text_max_x {
                 break;
             }
 
             let chip_x0 = x;
-            let chip_y0 = by + self.ui(8.0);
-            let chip_h = (bh - self.ui(16.0)).max(1.0);
+            let chip_y0 = by + (bh - chip_h) * 0.5;
 
             push_styled_rect(
                 rect_instances,
@@ -2615,22 +2887,105 @@ impl State {
                 action: button.action,
             });
 
-            // Position text centered inside the chip
-            let mut text_x = chip_x0 + chip_pad_h;
-            self.append_text_run(
+            // Center the icon in the chip
+            let icon_x = chip_x0 + (chip_w - icon_px) * 0.5;
+            let icon_y = chip_y0 + (chip_h - icon_px) * 0.5;
+            self.append_icon(
                 text_vertices,
-                &mut text_x,
-                baseline,
-                &button.label,
+                icon_x,
+                icon_y,
+                icon_px,
+                button.icon,
                 button.style.text,
-            )?;
+            );
 
-            // Advance x to the right edge of the chip
             x = chip_x0 + chip_w;
-
             prev_group = Some(button.group);
         }
 
+        Ok(())
+    }
+
+    fn build_tooltip_geometry(
+        &mut self,
+        text_vertices: &mut Vec<TextVertex>,
+        rect_instances: &mut Vec<StyledRectInstance>,
+    ) -> anyhow::Result<()> {
+        let Some(action) = self.hover_toolbar_action else {
+            return Ok(());
+        };
+        let Some(started) = self.hover_started_at else {
+            return Ok(());
+        };
+        if started.elapsed() < TOOLTIP_DELAY {
+            return Ok(());
+        }
+
+        let Some(button) = self
+            .toolbar_buttons
+            .iter()
+            .find(|b| b.action == action)
+            .copied()
+        else {
+            return Ok(());
+        };
+
+        let Some(label) = self
+            .toolbar_button_configs()
+            .into_iter()
+            .find(|c| c.action == action)
+            .map(|c| c.label)
+        else {
+            return Ok(());
+        };
+
+        let pad_x = self.ui(8.0);
+        let pad_y = self.ui(4.0);
+        let text_w = label.chars().count() as f32 * self.cell_width;
+        let text_h = self.line_height;
+        let tip_w = text_w + pad_x * 2.0;
+        let tip_h = text_h + pad_y * 2.0;
+        let gap = self.ui(6.0);
+
+        let btn_cx = (button.x0 + button.x1) * 0.5;
+        let mut tip_x = (btn_cx - tip_w * 0.5).round();
+        let tip_y = (button.y1 + gap).round();
+
+        let screen_w = self.size.width as f32;
+        let margin = self.ui(4.0);
+        if tip_x < margin {
+            tip_x = margin;
+        }
+        if tip_x + tip_w > screen_w - margin {
+            tip_x = (screen_w - margin - tip_w).max(margin);
+        }
+
+        let bg_top = theme::palette().tooltip_bg_top;
+        let bg_bottom = theme::palette().tooltip_bg_bottom;
+        let border = theme::palette().tooltip_border;
+        let text_color = theme::palette().tooltip_text;
+
+        push_styled_rect_glow(
+            rect_instances,
+            [tip_x, tip_y, tip_w, tip_h],
+            bg_top,
+            bg_bottom,
+            border,
+            [0.0, 0.0, 0.0, 0.45],
+            self.ui(5.0),
+            1.0,
+            1.0,
+            self.ui(10.0),
+            [0.0, self.ui(3.0)],
+            self.ui(1.0),
+            0.0,
+        );
+
+        let baseline = tip_y + pad_y + self.ascent;
+        let mut x = (tip_x + pad_x).round();
+        self.append_text_run(text_vertices, &mut x, baseline, &label, text_color)?;
+
+        self.tooltip_drawn = true;
         Ok(())
     }
 
@@ -2675,8 +3030,8 @@ impl State {
         push_styled_rect(
             &mut rect_instances,
             content,
-            theme::COLOR_CONTENT_TOP,
-            theme::COLOR_CONTENT_BOTTOM,
+            theme::palette().content_top,
+            theme::palette().content_bottom,
             [0.0; 4],
             [0.0; 4],
             0.0,
@@ -2691,13 +3046,13 @@ impl State {
         let files_focused = self.focus_pane == FocusPane::Files;
         let diff_focused = self.focus_pane == FocusPane::Diff;
 
-        // File pane top border (focus indicator)
+        // File pane top border (focus indicator) — teal accent
         if files_focused {
             push_styled_rect(
                 &mut rect_instances,
                 [file_pane[0], file_pane[1], file_pane[2], self.ui(2.0)],
-                theme::ACCENT_BLUE,
-                theme::ACCENT_BLUE,
+                theme::palette().accent_blue,
+                theme::palette().accent_blue,
                 [0.0; 4],
                 [0.0; 4],
                 0.0,
@@ -2709,13 +3064,13 @@ impl State {
             );
         }
 
-        // Diff pane top border (focus indicator)
+        // Diff pane top border (focus indicator) — teal accent
         if diff_focused {
             push_styled_rect(
                 &mut rect_instances,
                 [diff_pane[0], diff_pane[1], diff_pane[2], self.ui(2.0)],
-                theme::ACCENT_BLUE,
-                theme::ACCENT_BLUE,
+                theme::palette().accent_blue,
+                theme::palette().accent_blue,
                 [0.0; 4],
                 [0.0; 4],
                 0.0,
@@ -2732,8 +3087,8 @@ impl State {
         push_styled_rect(
             &mut rect_instances,
             [divider_x, content[1], self.ui(1.0), content[3]],
-            theme::DIVIDER_COLOR,
-            theme::DIVIDER_COLOR,
+            theme::palette().divider,
+            theme::palette().divider,
             [0.0; 4],
             [0.0; 4],
             0.0,
@@ -2788,9 +3143,9 @@ impl State {
                             (pane[2] - self.ui(8.0)).max(1.0),
                             self.line_height,
                         ],
-                        COLOR_ROW_SELECTED,
-                        COLOR_ROW_SELECTED_BOTTOM,
-                        COLOR_ROW_SELECTED_BORDER,
+                        theme::palette().row_selected,
+                        theme::palette().row_selected_bottom,
+                        theme::palette().row_selected_border,
                         [0.0; 4],
                         self.ui(5.0),
                         1.0,
@@ -2808,8 +3163,8 @@ impl State {
                             self.ui(3.0),
                             self.line_height - self.ui(4.0),
                         ],
-                        COLOR_SELECTION_ACCENT_BAR,
-                        COLOR_SELECTION_ACCENT_BAR,
+                        theme::palette().selection_accent_bar,
+                        theme::palette().selection_accent_bar,
                         [0.0; 4],
                         [0.0; 4],
                         self.ui(1.5),
@@ -2870,8 +3225,8 @@ impl State {
             push_styled_rect(
                 &mut rect_instances,
                 [pane[0], pane[1], ln_width, pane[3]],
-                [0.06, 0.065, 0.08, 1.0],
-                [0.055, 0.06, 0.075, 1.0],
+                theme::palette().gutter_top,
+                theme::palette().gutter_bottom,
                 [0.0; 4],
                 [0.0; 4],
                 0.0,
@@ -2886,8 +3241,8 @@ impl State {
             push_styled_rect(
                 &mut rect_instances,
                 [pane[0] + ln_width, pane[1], 1.0, pane[3]],
-                theme::DIVIDER_COLOR,
-                theme::DIVIDER_COLOR,
+                theme::palette().divider,
+                theme::palette().divider,
                 [0.0; 4],
                 [0.0; 4],
                 0.0,
@@ -2962,7 +3317,7 @@ impl State {
 
                     let baseline = screen_y + self.ascent;
                     let mut ln_x = pane[0] + self.ui(4.0);
-                    let ln_color = theme::TEXT_MUTED;
+                    let ln_color = theme::palette().text_muted;
                     self.append_text_run(
                         &mut text_vertices,
                         &mut ln_x,
@@ -2988,6 +3343,7 @@ impl State {
         // ── Bottom chrome + modals (rendered AFTER panes so they overlay) ─
         self.build_status_geometry(&mut text_vertices, &mut rect_instances)?;
         self.build_modal_overlay_geometry(&mut text_vertices, &mut rect_instances)?;
+        self.build_tooltip_geometry(&mut text_vertices, &mut rect_instances)?;
 
         self.text_vbuf = create_vertex_buffer(&self.device, "text_vertices", &text_vertices);
         self.text_vcount = text_vertices.len() as u32;
@@ -3357,7 +3713,7 @@ impl State {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(COLOR_BG),
+                        load: wgpu::LoadOp::Clear(theme::palette().bg),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3408,10 +3764,29 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes()
-            .with_title("wgit")
-            .with_decorations(false)
-            .with_transparent(true);
+        // Base attributes shared across platforms. The window itself is
+        // opaque — we paint every pixel ourselves, and OS-level alpha
+        // bleeding to the desktop is jarring under modals/scrims.
+        let mut attrs = Window::default_attributes().with_title("wgit");
+
+        // macOS: native frame with the title bar made transparent and
+        // hidden, content extending into the title bar. macOS draws the
+        // real traffic lights; our gradient paints behind them.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true);
+        }
+
+        // Other platforms: keep the borderless, custom-drawn chrome.
+        #[cfg(not(target_os = "macos"))]
+        {
+            attrs = attrs.with_decorations(false);
+        }
+
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let git = self.git.take().expect("git model available");
         let state = pollster::block_on(State::new(window.clone(), git)).expect("init state");
@@ -3459,6 +3834,30 @@ impl ApplicationHandler for App {
                     st.window.set_cursor(CursorIcon::EwResize);
                 } else {
                     st.window.set_cursor(CursorIcon::Default);
+                }
+
+                let hovered = st.toolbar_action_at(position);
+                if hovered != st.hover_toolbar_action {
+                    let was_visible = st.tooltip_drawn;
+                    st.hover_toolbar_action = hovered;
+                    st.hover_started_at = hovered.map(|_| Instant::now());
+                    st.tooltip_drawn = false;
+                    if was_visible {
+                        st.geometry_dirty = true;
+                        needs_redraw = true;
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if st.hover_toolbar_action.is_some() {
+                    let was_visible = st.tooltip_drawn;
+                    st.hover_toolbar_action = None;
+                    st.hover_started_at = None;
+                    st.tooltip_drawn = false;
+                    if was_visible {
+                        st.geometry_dirty = true;
+                        needs_redraw = true;
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -3600,6 +3999,27 @@ impl ApplicationHandler for App {
 
         if needs_redraw {
             st.window.request_redraw();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        let Some(started) = st.hover_started_at else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        let elapsed = started.elapsed();
+        if elapsed < TOOLTIP_DELAY {
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(started + TOOLTIP_DELAY));
+        } else if !st.tooltip_drawn {
+            st.geometry_dirty = true;
+            st.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
