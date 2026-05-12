@@ -156,6 +156,13 @@ struct State {
     rect_instance_vbuf: wgpu::Buffer,
     rect_instance_count: u32,
 
+    // Overlay layer (modals, tooltips) — drawn on top of the base
+    // text layer so the panel fill fully occludes the text behind it.
+    overlay_text_vbuf: wgpu::Buffer,
+    overlay_text_vcount: u32,
+    overlay_rect_instance_vbuf: wgpu::Buffer,
+    overlay_rect_instance_count: u32,
+
     layout_dirty: bool,
     geometry_dirty: bool,
 }
@@ -418,9 +425,19 @@ impl State {
             "empty_text",
             std::mem::size_of::<TextVertex>() as u64,
         );
+        let empty_overlay_text_vbuf = create_empty_buffer(
+            &device,
+            "empty_overlay_text",
+            std::mem::size_of::<TextVertex>() as u64,
+        );
         let empty_rect_inst_vbuf = create_empty_buffer(
             &device,
             "empty_rect_instances",
+            std::mem::size_of::<StyledRectInstance>() as u64,
+        );
+        let empty_overlay_rect_inst_vbuf = create_empty_buffer(
+            &device,
+            "empty_overlay_rect_instances",
             std::mem::size_of::<StyledRectInstance>() as u64,
         );
 
@@ -498,6 +515,10 @@ impl State {
             rect_unit_vbuf,
             rect_instance_vbuf: empty_rect_inst_vbuf,
             rect_instance_count: 0,
+            overlay_text_vbuf: empty_overlay_text_vbuf,
+            overlay_text_vcount: 0,
+            overlay_rect_instance_vbuf: empty_overlay_rect_inst_vbuf,
+            overlay_rect_instance_count: 0,
             layout_dirty: true,
             geometry_dirty: true,
         };
@@ -860,6 +881,11 @@ impl State {
             }
             Key::Named(NamedKey::Backspace) => {
                 self.current_commit_target().pop();
+                self.update_commit_prompt();
+                Ok(true)
+            }
+            Key::Named(NamedKey::Space) => {
+                self.current_commit_target().push(' ');
                 self.update_commit_prompt();
                 Ok(true)
             }
@@ -3340,10 +3366,18 @@ impl State {
             }
         }
 
-        // ── Bottom chrome + modals (rendered AFTER panes so they overlay) ─
+        // ── Bottom chrome (rendered AFTER panes so it overlays) ──
         self.build_status_geometry(&mut text_vertices, &mut rect_instances)?;
-        self.build_modal_overlay_geometry(&mut text_vertices, &mut rect_instances)?;
-        self.build_tooltip_geometry(&mut text_vertices, &mut rect_instances)?;
+
+        // ── Overlay layer: modals + tooltips ────────────────────
+        // Rendered as a separate pass *after* the base text so the
+        // panel/tooltip fill fully occludes the UI text behind it —
+        // otherwise the base text batch (drawn after the base rects)
+        // would bleed through the overlay's translucent-looking fill.
+        let mut overlay_text = Vec::<TextVertex>::new();
+        let mut overlay_rects = Vec::<StyledRectInstance>::new();
+        self.build_modal_overlay_geometry(&mut overlay_text, &mut overlay_rects)?;
+        self.build_tooltip_geometry(&mut overlay_text, &mut overlay_rects)?;
 
         self.text_vbuf = create_vertex_buffer(&self.device, "text_vertices", &text_vertices);
         self.text_vcount = text_vertices.len() as u32;
@@ -3351,6 +3385,14 @@ impl State {
         self.rect_instance_vbuf =
             create_vertex_buffer(&self.device, "styled_rect_instances", &rect_instances);
         self.rect_instance_count = rect_instances.len() as u32;
+
+        self.overlay_text_vbuf =
+            create_vertex_buffer(&self.device, "overlay_text_vertices", &overlay_text);
+        self.overlay_text_vcount = overlay_text.len() as u32;
+
+        self.overlay_rect_instance_vbuf =
+            create_vertex_buffer(&self.device, "overlay_rect_instances", &overlay_rects);
+        self.overlay_rect_instance_count = overlay_rects.len() as u32;
 
         self.geometry_dirty = false;
         Ok(())
@@ -3736,6 +3778,23 @@ impl State {
                 pass.set_bind_group(1, &self.uniform_bg, &[]);
                 pass.set_vertex_buffer(0, self.text_vbuf.slice(..));
                 pass.draw(0..self.text_vcount, 0..1);
+            }
+
+            // ── Overlay layer (modals, tooltips) on top of base text ─
+            if self.overlay_rect_instance_count > 0 {
+                pass.set_pipeline(&self.rect_pipeline);
+                pass.set_bind_group(0, &self.uniform_bg, &[]);
+                pass.set_vertex_buffer(0, self.rect_unit_vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.overlay_rect_instance_vbuf.slice(..));
+                pass.draw(0..6, 0..self.overlay_rect_instance_count);
+            }
+
+            if self.overlay_text_vcount > 0 {
+                pass.set_pipeline(&self.text_pipeline);
+                pass.set_bind_group(0, &self.text_bg, &[]);
+                pass.set_bind_group(1, &self.uniform_bg, &[]);
+                pass.set_vertex_buffer(0, self.overlay_text_vbuf.slice(..));
+                pass.draw(0..self.overlay_text_vcount, 0..1);
             }
         }
 
