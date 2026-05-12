@@ -92,29 +92,71 @@ fn apply_theme_selection() -> anyhow::Result<()> {
 
 fn open_startup_repo() -> anyhow::Result<GitModel> {
     if let Some(path) = repo_arg() {
-        return open_and_remember(path);
+        match open_and_remember(&path) {
+            Ok(git) => return Ok(git),
+            Err(err) => {
+                eprintln!("{err}");
+                // Fall through to the picker rather than aborting — the
+                // path arg may be bogus (e.g. a Finder `-psn` token).
+            }
+        }
     }
 
-    match GitModel::open() {
-        Ok(git) => {
-            let _ = repo_store::remember_repo(git.repo_root());
-            Ok(git)
-        }
-        Err(current_dir_err) => {
-            let recent = repo_store::recent_repos().unwrap_or_default();
-            for path in recent {
-                if let Ok(git) = open_and_remember(path.clone()) {
-                    eprintln!(
-                        "Opened recent repository {} after current directory lookup failed: {}",
-                        git.repo_root().display(),
-                        current_dir_err
-                    );
-                    return Ok(git);
-                }
-            }
+    if let Ok(git) = GitModel::open() {
+        let _ = repo_store::remember_repo(git.repo_root());
+        return Ok(git);
+    }
 
-            Err(current_dir_err)
-                .context("not in a git repository and no recent repository could be reopened")
+    for path in repo_store::recent_repos().unwrap_or_default() {
+        if let Ok(git) = open_and_remember(&path) {
+            eprintln!(
+                "Opened recent repository {} (current directory is not a git repo)",
+                git.repo_root().display()
+            );
+            return Ok(git);
+        }
+    }
+
+    // No repo from CWD or history — common when launched from Finder,
+    // where the working directory is `/`. Ask the user to pick one
+    // instead of crashing with a console-only error.
+    prompt_for_repo()
+}
+
+/// Show a native folder picker until the user selects a valid git
+/// repository, or cancels (in which case we exit quietly).
+fn prompt_for_repo() -> anyhow::Result<GitModel> {
+    let start_dir = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    loop {
+        let picked = rfd::FileDialog::new()
+            .set_title("wgit — Open a Git Repository")
+            .set_directory(&start_dir)
+            .pick_folder();
+
+        let Some(path) = picked else {
+            // User cancelled — nothing to open.
+            std::process::exit(0);
+        };
+
+        match GitModel::open_at(&path) {
+            Ok(git) => {
+                let _ = repo_store::remember_repo(git.repo_root());
+                return Ok(git);
+            }
+            Err(err) => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("Not a Git repository")
+                    .set_description(format!(
+                        "{} couldn't be opened as a git repository.\n\n{err}",
+                        path.display()
+                    ))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            }
         }
     }
 }
